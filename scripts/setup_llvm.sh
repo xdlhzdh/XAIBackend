@@ -2,8 +2,8 @@
 # Materialize third_party/llvm-project from the pinned upstream commit.
 #
 # The git object store lives in third_party/cache and is never patched.
-# The build tree is a pristine archive plus patches/series plus this
-# repository's llvm/ overlay. It has no .git directory.
+# third_party/llvm-project has no .git directory. patches/series is applied
+# to that tree; a matching .xai-stamp skips the patches.
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/llvm_vendor.sh"

@@ -4,11 +4,11 @@
 
 XAI 是教学用目标，架构名 `xai`。LLVM 的 OS 类型里已经占用了 `aix`，因此本目标使用独立的架构枚举 `Triple::xai`。输入是 LLVM IR，输出是文本汇编。没有硬件、模拟器、汇编器或目标文件编码器。
 
-源码按 LLVM 树内路径放在仓库的 `llvm/`。上游提交记在 `patches/llvm-project.rev`。`scripts/setup_llvm.sh` 从该提交导出没有 `.git` 的树，按 `patches/series` 打补丁，再把 `llvm/` 复制上去。`llc` 在 `third_party/llvm-project/build/bin/llc`。
+新增源码按 LLVM 树内路径放在仓库的 `llvm/`，由 `patches/0002-add-xai-backend.patch` 打进构建树。setup 只应用 `patches/series`，不另做目录复制。上游提交记在 `patches/llvm-project.rev`。构建树是 `third_party/llvm-project`，没有 `.git`。`llc` 在 `third_party/llvm-project/build/bin/llc`。
 
 ## 1. 流水线
 
-AI 后端和 CPU 后端共用 LLVM CodeGen。目标之间的差别在寄存器类、合法类型、调用约定、指令选择和汇编打印。XAI 只替换这些描述，调度、寄存器分配、prolog/epilog 使用 LLVM 的默认 pass。
+AI 后端和 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、分配与栈帧钩子、MC 打印。调度 pass 按目标设置的 `Sched::RegPressure` 运行，没有指令行程。PEI 仍是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。
 
 ```mermaid
 flowchart TD
@@ -25,7 +25,18 @@ flowchart TD
   ir --> legal --> isel --> mi --> ra --> pei --> mc --> asm --> text
 ```
 
-`XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 挂上 `XAIDAGToDAGISel`。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
+`XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 挂上 `XAIDAGToDAGISel`，其余 pass 使用 TargetPassConfig 的默认序列。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small，函数对齐是 4 字节。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
+
+| 阶段 | LLVM 负责 | 本仓库中的实现 |
+|---|---|---|
+| 目标注册 | `TargetRegistry`，按 triple 选择 `TargetMachine` | `TargetInfo/XAITargetInfo.cpp`，`RegisterTarget<Triple::xai>` |
+| 类型合法化 | 按合法类型拆分或提升非法类型 | `XAIISelLowering.cpp` 登记 `i64`、`v256f16`、`v256f32` |
+| 调用约定 | `CCState` 按 TableGen 规则分配位置 | `XAICallingConv.td` 的 `CC_XAI`，C++ 拒绝栈参数和非 `void` 返回 |
+| 指令选择 | SelectionDAG 匹配 `Pat`，Custom 节点调用 `LowerOperation` | `XAIInstrInfo.td`；访存和 `BR_CC` 在 C++ 中完成 |
+| 分支折叠 | BranchFolder 调用 `analyzeBranch` 等钩子 | `XAIInstrInfo.cpp` |
+| 寄存器分配 | 分配虚拟寄存器，必要时插入 spill | `copyPhysReg`，以及 `xai.st` / `xai.ld`、`xai.mstore.f32` / `xai.mload.f32` |
+| 栈帧 | PEI 调用 prologue、epilogue 和帧索引消除 | `XAIFrameLowering.cpp`、`XAIRegisterInfo::eliminateFrameIndex` |
+| 汇编打印 | AsmPrinter 把 `MachineInstr` 送到 MC 流 | `XAIAsmPrinter.cpp`、`XAIInstPrinter.cpp` |
 
 Data layout：
 
@@ -143,7 +154,7 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 
 1. `CondBr` 在 SelectionDAGBuilder 里变成 `SETCC` 与 `BRCOND`，假分支再接一条 `BR`。
 2. `ISD::BRCOND` 的动作是 Expand。操作数是 `SETCC` 且比较类型为 `i64` 时，展开为 `ISD::BR_CC`。
-3. `ISD::BR_CC` 对 `i64` 是 Custom。`LowerBR_CC` 按条件码生成一条比较跳转，chain 放在机器节点操作数的最后。
+3. `ISD::BR_CC` 对 `i64` 是 Custom。`LowerBR_CC` 按条件码生成一条比较跳转。基本块的类型也是 `MVT::Other`，指令发射器只把最后一个 `Other` 操作数当作 chain，所以机器节点的操作数顺序是比较的两端、目标块，最后才是 chain。
 
 | 条件码 | 指令 |
 |---|---|
@@ -161,13 +172,12 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 | 钩子 | 行为 |
 |---|---|
 | `copyPhysReg` | GPR 用 `xai.mov`，MR 用 `xai.mmov` |
-| `analyzeBranch` / `insertBranch` / `removeBranch` | 识别条件分支和 `xai.br`，删掉跳到下一块的无条件分支 |
 | `isCopyInstrImpl` | 识别这两条拷贝，供合并使用 |
 | `storeRegToStackSlot` / `loadRegFromStackSlot` | GPR 用 `xai.st` / `xai.ld`；MR 用 `xai.mstore.f32` / `xai.mload.f32` |
 | `eliminateFrameIndex` | 见下文 |
 | `emitPrologue` / `emitEpilogue` | 栈大小非 0 时用 `xai.addi` 调整 `r31` |
 
-帧向下增长，对齐 1024 字节，局部区域偏移为 0，没有 frame pointer。栈大小为 0 时 prologue 和 epilogue 都不插入指令。
+帧向下增长，对齐 1024 字节，局部区域偏移为 0，没有 frame pointer。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。栈大小为 0 时 `adjustSP` 不插入指令。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
 
 spill 槽在分配期间是帧索引。`eliminateFrameIndex` 把该操作数改成 `r31`，并把下一条立即数设为：
 
@@ -289,6 +299,7 @@ TableGen 生成 `XAIGenDAGISel.inc`、`XAIGenInstrInfo.inc`、`XAIGenRegisterInf
 - `void` 函数，参数是不超过 8 个的 `ptr` 或 `i64`
 - 五条 `llvm.xai.*` intrinsic
 - `i64` 的 `add`，以及有符号 32 位立即数加法和常量
+- GPR spill 使用的 `xai.ld` / `xai.st`。现有测试只迫使矩阵寄存器 spill
 - `getelementptr i8` 的常量字节偏移，偏移落在有符号 32 位以内
 - `icmp eq`、`icmp ne`、`icmp ult` 与对应的条件分支，以及无条件 `br`
 
