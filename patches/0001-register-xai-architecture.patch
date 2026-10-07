@@ -1,0 +1,186 @@
+Subject: [PATCH] Register the XAI architecture with upstream LLVM
+
+Selecting -mtriple=xai requires in-tree hooks: the architecture enum and
+its names, the data layout, LLVM_ALL_TARGETS, and the intrinsic TableGen
+include. Files that do not exist upstream are added by the next patch in
+the series.
+
+Upstream-revision: 068c6c5c0c8a0555036a2ff09a99f486548e6e8d
+
+---
+diff --git a/llvm/CMakeLists.txt b/llvm/CMakeLists.txt
+index 6001928f9..a32ff7be8 100644
+--- a/llvm/CMakeLists.txt
++++ b/llvm/CMakeLists.txt
+@@ -589,6 +589,9 @@ set(LLVM_ALL_TARGETS
+   WebAssembly
+   X86
+   XCore
++  # XAI-ALL-TARGETS
++  XAI
++  # XAI-ALL-TARGETS
+   )
+ 
+ set(LLVM_ALL_EXPERIMENTAL_TARGETS
+diff --git a/llvm/include/llvm/IR/CMakeLists.txt b/llvm/include/llvm/IR/CMakeLists.txt
+index c5c4cc4d2..6521350d5 100644
+--- a/llvm/include/llvm/IR/CMakeLists.txt
++++ b/llvm/include/llvm/IR/CMakeLists.txt
+@@ -25,4 +25,7 @@ tablegen(LLVM IntrinsicsWebAssembly.h -gen-intrinsic-enums -intrinsic-prefix=was
+ tablegen(LLVM IntrinsicsX86.h -gen-intrinsic-enums -intrinsic-prefix=x86)
+ tablegen(LLVM IntrinsicsXCore.h -gen-intrinsic-enums -intrinsic-prefix=xcore)
+ tablegen(LLVM IntrinsicsVE.h -gen-intrinsic-enums -intrinsic-prefix=ve)
++# XAI-INTRINSIC-ENUM
++tablegen(LLVM IntrinsicsXAI.h -gen-intrinsic-enums -intrinsic-prefix=xai)
++# XAI-INTRINSIC-ENUM
+ add_public_tablegen_target(intrinsics_gen)
+diff --git a/llvm/include/llvm/IR/Intrinsics.td b/llvm/include/llvm/IR/Intrinsics.td
+index 993ddd7e3..0db57dbcb 100644
+--- a/llvm/include/llvm/IR/Intrinsics.td
++++ b/llvm/include/llvm/IR/Intrinsics.td
+@@ -3060,5 +3060,8 @@ include "llvm/IR/IntrinsicsSPIRV.td"
+ include "llvm/IR/IntrinsicsVE.td"
+ include "llvm/IR/IntrinsicsDirectX.td"
+ include "llvm/IR/IntrinsicsLoongArch.td"
++// XAI-INTRINSICS
++include "llvm/IR/IntrinsicsXAI.td"
++// XAI-INTRINSICS
+ 
+ #endif // TEST_INTRINSICS_SUPPRESS_DEFS
+diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
+index 7b24db121..566988a0a 100644
+--- a/llvm/include/llvm/TargetParser/Triple.h
++++ b/llvm/include/llvm/TargetParser/Triple.h
+@@ -114,7 +114,10 @@ public:
+     renderscript32, // 32-bit RenderScript
+     renderscript64, // 64-bit RenderScript
+     ve,             // NEC SX-Aurora Vector Engine
+-    LastArchType = ve
++    // XAI-ARCH-ENUM
++    xai,            // XAI: teaching matrix ISA
++    LastArchType = xai
++    // XAI-ARCH-ENUM
+   };
+   enum SubArchType {
+     NoSubArch,
+diff --git a/llvm/lib/TargetParser/TargetDataLayout.cpp b/llvm/lib/TargetParser/TargetDataLayout.cpp
+index a2125eeb8..4a3b4e63e 100644
+--- a/llvm/lib/TargetParser/TargetDataLayout.cpp
++++ b/llvm/lib/TargetParser/TargetDataLayout.cpp
+@@ -649,6 +649,10 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
+     return computeWebAssemblyDataLayout(*this);
+   case Triple::ve:
+     return computeVEDataLayout(*this);
++  // XAI-DATALAYOUT
++  case Triple::xai:
++    return "e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192";
++  // XAI-DATALAYOUT
+ 
+   case Triple::amdil:
+   case Triple::amdil64:
+diff --git a/llvm/lib/TargetParser/Triple.cpp b/llvm/lib/TargetParser/Triple.cpp
+index c6515425b..0df3e3d4a 100644
+--- a/llvm/lib/TargetParser/Triple.cpp
++++ b/llvm/lib/TargetParser/Triple.cpp
+@@ -136,6 +136,10 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
+     return "thumb";
+   case thumbeb:
+     return "thumbeb";
++  // XAI-ARCH-NAME
++  case xai:
++    return "xai";
++  // XAI-ARCH-NAME
+   case ve:
+     return "ve";
+   case wasm32:
+@@ -337,6 +341,10 @@ StringRef Triple::getArchTypePrefix(ArchType Kind) {
+   case riscv64be:
+     return "riscv";
+ 
++  // XAI-ARCH-PREFIX
++  case xai:
++    return "xai";
++  // XAI-ARCH-PREFIX
+   case ve:
+     return "ve";
+   case csky:
+@@ -720,6 +728,9 @@ Triple::ArchType Triple::getArchTypeForLLVMName(StringRef Name) {
+       .Case("wasm64", wasm64)
+       .Case("renderscript32", renderscript32)
+       .Case("renderscript64", renderscript64)
++      // XAI-LLVM-NAME
++      .Case("xai", xai)
++      // XAI-LLVM-NAME
+       .Case("ve", ve)
+       .Case("csky", csky)
+       .Case("loongarch32", loongarch32)
+@@ -868,6 +879,9 @@ Triple::ArchType Triple::parseArch(StringRef ArchName) {
+           .Case("renderscript32", Triple::renderscript32)
+           .Case("renderscript64", Triple::renderscript64)
+           .Case("shave", Triple::shave)
++          // XAI-PARSE-ARCH
++          .Case("xai", Triple::xai)
++          // XAI-PARSE-ARCH
+           .Case("ve", Triple::ve)
+           .Case("wasm32", Triple::wasm32)
+           .Case("wasm64", Triple::wasm64)
+@@ -1240,6 +1254,9 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
+   case Triple::tcele64:
+   case Triple::thumbeb:
+   case Triple::ve:
++  // XAI-OBJFMT
++  case Triple::xai:
++  // XAI-OBJFMT
+   case Triple::xcore:
+   case Triple::xtensa:
+     return Triple::ELF;
+@@ -2030,6 +2047,9 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
+   case llvm::Triple::tcele64:
+   case llvm::Triple::systemz:
+   case llvm::Triple::ve:
++  // XAI-PTRWIDTH
++  case llvm::Triple::xai:
++  // XAI-PTRWIDTH
+   case llvm::Triple::wasm64:
+   case llvm::Triple::x86_64:
+     return 64;
+@@ -2078,6 +2098,9 @@ Triple Triple::get32BitArchVariant() const {
+   case Triple::msp430:
+   case Triple::systemz:
+   case Triple::ve:
++  // XAI-ARCH32
++  case Triple::xai:
++  // XAI-ARCH32
+     T.setArch(UnknownArch);
+     break;
+ 
+@@ -2225,6 +2248,9 @@ Triple Triple::get64BitArchVariant() const {
+   case Triple::systemz:
+   case Triple::tcele64:
+   case Triple::ve:
++  // XAI-ARCH64
++  case Triple::xai:
++  // XAI-ARCH64
+   case Triple::wasm64:
+   case Triple::x86_64:
+     // Already 64-bit.
+@@ -2338,6 +2364,9 @@ Triple Triple::getBigEndianArchVariant() const {
+   case Triple::x86_64:
+   case Triple::xcore:
+   case Triple::ve:
++  // XAI-BIGEND
++  case Triple::xai:
++  // XAI-BIGEND
+   case Triple::csky:
+   case Triple::xtensa:
+ 
+@@ -2480,6 +2509,9 @@ bool Triple::isLittleEndian() const {
+   case Triple::tcele64:
+   case Triple::thumb:
+   case Triple::ve:
++  // XAI-LITEND
++  case Triple::xai:
++  // XAI-LITEND
+   case Triple::wasm32:
+   case Triple::wasm64:
+   case Triple::x86:

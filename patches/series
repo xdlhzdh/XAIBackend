@@ -1,0 +1,4 @@
+# Patches applied, in order, to a pristine tree of patches/llvm-project.rev.
+# Paths are relative to patches/. Blank lines and comments are ignored.
+0001-register-xai-architecture.patch
+0002-add-xai-backend.patch
