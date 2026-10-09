@@ -539,7 +539,7 @@ diff --git a/llvm/lib/Target/XAI/XAI.td b/llvm/lib/Target/XAI/XAI.td
 new file mode 100644
 --- /dev/null
 +++ b/llvm/lib/Target/XAI/XAI.td
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +//===-- XAI.td - Describe the XAI target machine ------------*- tablegen -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -553,6 +553,7 @@ new file mode 100644
 +include "XAIRegisterInfo.td"
 +include "XAICallingConv.td"
 +include "XAIInstrInfo.td"
++include "XAISchedule.td"
 +
 +defm : RemapAllTargetPseudoPointerOperands<GPR>;
 +
@@ -563,7 +564,7 @@ new file mode 100644
 +  bit isMCAsmWriter = 1;
 +}
 +
-+def : Processor<"generic", NoItineraries, []>;
++def : ProcessorModel<"generic", XAIModel, []>;
 +
 +def XAI : Target {
 +  let InstructionSet = XAIInstrInfo;
@@ -1653,6 +1654,50 @@ new file mode 100644
 +                       (sequence "M%u", 0, 7)> {
 +  let Size = 8192;
 +}
+diff --git a/llvm/lib/Target/XAI/XAISchedule.td b/llvm/lib/Target/XAI/XAISchedule.td
+new file mode 100644
+--- /dev/null
++++ b/llvm/lib/Target/XAI/XAISchedule.td
+@@ -0,0 +1,39 @@
++//===-- XAISchedule.td - XAI scheduling model ---------------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// In-order model used by the pre-RA and post-RA machine schedulers.
++// Latencies are relative teaching costs, not measured cycles. The pipe issues
++// one instruction per cycle; a result stays unread until its latency elapses,
++// so an independent GPR op can fill the gap between a matrix load and xai.mma.
++
++def XAIModel : SchedMachineModel {
++  let IssueWidth = 1;
++  let MicroOpBufferSize = 0;
++  let LoadLatency = 4;
++  let HighLatency = 4;
++  let MispredictPenalty = 0;
++  let PostRAScheduler = 1;
++  let CompleteModel = 1;
++}
++
++let SchedModel = XAIModel in {
++  def XAIPipe : ProcResource<1>;
++
++  def XAIWriteGPR : SchedWriteRes<[XAIPipe]> { let Latency = 1; }
++  def XAIWriteMLoad : SchedWriteRes<[XAIPipe]> { let Latency = 4; }
++  def XAIWriteMMA : SchedWriteRes<[XAIPipe]> { let Latency = 4; }
++  def XAIWriteMStore : SchedWriteRes<[XAIPipe]> { let Latency = 2; }
++
++  def : InstRW<[XAIWriteGPR],
++               (instrs XAI_ADD, XAI_ADDI, XAI_LI, XAI_MOV, XAI_MMOV, XAI_LD,
++                       XAI_ST, XAI_BR, XAI_BEQ, XAI_BNE, XAI_BLTU, XAI_BGEU,
++                       XAI_RET, COPY)>;
++  def : InstRW<[XAIWriteMLoad], (instrs XAI_MLOAD_F16, XAI_MLOAD_F32)>;
++  def : InstRW<[XAIWriteMMA], (instrs XAI_MMA)>;
++  def : InstRW<[XAIWriteMStore], (instrs XAI_MSTORE_F16, XAI_MSTORE_F32)>;
++}
 diff --git a/llvm/lib/Target/XAI/XAISubtarget.cpp b/llvm/lib/Target/XAI/XAISubtarget.cpp
 new file mode 100644
 --- /dev/null
@@ -1695,7 +1740,7 @@ diff --git a/llvm/lib/Target/XAI/XAISubtarget.h b/llvm/lib/Target/XAI/XAISubtarg
 new file mode 100644
 --- /dev/null
 +++ b/llvm/lib/Target/XAI/XAISubtarget.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,58 @@
 +//===-- XAISubtarget.h - Define Subtarget for the XAI -----------*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -1736,6 +1781,8 @@ new file mode 100644
 +
 +  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
 +
++  bool enableMachineScheduler() const override { return true; }
++
 +  const XAIInstrInfo *getInstrInfo() const override { return &InstrInfo; }
 +  const XAITargetLowering *getTargetLowering() const override { return &TLInfo; }
 +  const XAIFrameLowering *getFrameLowering() const override {
@@ -1756,7 +1803,7 @@ diff --git a/llvm/lib/Target/XAI/XAITargetMachine.cpp b/llvm/lib/Target/XAI/XAIT
 new file mode 100644
 --- /dev/null
 +++ b/llvm/lib/Target/XAI/XAITargetMachine.cpp
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,76 @@
 +//===-- XAITargetMachine.cpp - Define TargetMachine for XAI ---------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -1811,7 +1858,10 @@ new file mode 100644
 +class XAIPassConfig : public TargetPassConfig {
 +public:
 +  XAIPassConfig(XAITargetMachine &TM, PassManagerBase &PM)
-+      : TargetPassConfig(TM, PM) {}
++      : TargetPassConfig(TM, PM) {
++    if (TM.getOptLevel() != CodeGenOptLevel::None)
++      substitutePass(&PostRASchedulerID, &PostMachineSchedulerID);
++  }
 +
 +  XAITargetMachine &getXAITargetMachine() const {
 +    return getTM<XAITargetMachine>();
@@ -1956,6 +2006,47 @@ new file mode 100644
 +  %vc = call <256 x float> @llvm.xai.mload.f32(ptr %c)
 +  %vr = call <256 x float> @llvm.xai.mma(<256 x half> %va, <256 x half> %vb, <256 x float> %vc)
 +  call void @llvm.xai.mstore.f32(ptr %c, <256 x float> %vr)
++  ret void
++}
+diff --git a/llvm/test/CodeGen/XAI/sched.ll b/llvm/test/CodeGen/XAI/sched.ll
+new file mode 100644
+--- /dev/null
++++ b/llvm/test/CodeGen/XAI/sched.ll
+@@ -0,0 +1,36 @@
++; The address add does not depend on the matrix multiply. Scheduling moves it
++; into the gap between the matrix loads and xai.mma. -O0 keeps source order.
++; RUN: llc -mtriple=xai -verify-machineinstrs -o - %s | FileCheck %s
++; RUN: llc -mtriple=xai -O0 -verify-machineinstrs -o - %s | FileCheck %s --check-prefix=O0
++
++declare <256 x half> @llvm.xai.mload.f16(ptr)
++declare <256 x float> @llvm.xai.mload.f32(ptr)
++declare void @llvm.xai.mstore.f32(ptr, <256 x float>)
++declare <256 x float> @llvm.xai.mma(<256 x half>, <256 x half>, <256 x float>)
++
++define void @hide_load_latency(ptr %a, ptr %b, ptr %c, ptr %d) {
++; CHECK-LABEL: hide_load_latency:
++; CHECK: xai.mload.f16
++; CHECK: xai.mload.f16
++; CHECK: xai.mload.f32
++; CHECK-NEXT: xai.addi r0, r3, 64
++; CHECK-NEXT: xai.mma
++; CHECK-NEXT: xai.mstore.f32
++; CHECK-NEXT: xai.mload.f32
++; CHECK-NEXT: xai.mstore.f32
++; CHECK-NEXT: xai.ret
++; O0-LABEL: hide_load_latency:
++; O0: xai.mload.f32
++; O0-NEXT: xai.mma
++; O0-NEXT: xai.mstore.f32
++; O0-NEXT: xai.addi r0, r3, 64
++  %va = call <256 x half> @llvm.xai.mload.f16(ptr %a)
++  %vb = call <256 x half> @llvm.xai.mload.f16(ptr %b)
++  %vc = call <256 x float> @llvm.xai.mload.f32(ptr %c)
++  %vr = call <256 x float> @llvm.xai.mma(<256 x half> %va, <256 x half> %vb, <256 x float> %vc)
++  call void @llvm.xai.mstore.f32(ptr %c, <256 x float> %vr)
++  %d2 = getelementptr i8, ptr %d, i64 64
++  %vd = call <256 x float> @llvm.xai.mload.f32(ptr %d2)
++  call void @llvm.xai.mstore.f32(ptr %d, <256 x float> %vd)
 +  ret void
 +}
 diff --git a/llvm/test/CodeGen/XAI/spill.ll b/llvm/test/CodeGen/XAI/spill.ll

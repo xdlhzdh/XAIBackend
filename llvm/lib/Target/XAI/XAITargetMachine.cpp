@@ -52,7 +52,10 @@ namespace {
 class XAIPassConfig : public TargetPassConfig {
 public:
   XAIPassConfig(XAITargetMachine &TM, PassManagerBase &PM)
-      : TargetPassConfig(TM, PM) {}
+      : TargetPassConfig(TM, PM) {
+    if (TM.getOptLevel() != CodeGenOptLevel::None)
+      substitutePass(&PostRASchedulerID, &PostMachineSchedulerID);
+  }
 
   XAITargetMachine &getXAITargetMachine() const {
     return getTM<XAITargetMachine>();

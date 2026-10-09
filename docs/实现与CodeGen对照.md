@@ -8,21 +8,23 @@ XAI 是教学用目标，架构名 `xai`。LLVM 的 OS 类型里已经占用了 
 
 ## 1. 流水线
 
-AI 后端和 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、分配与栈帧钩子、MC 打印。调度 pass 按目标设置的 `Sched::RegPressure` 运行，没有指令行程。PEI 仍是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。
+AI 后端和 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、MachineScheduler、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、调度模型、分配与栈帧钩子、MC 打印。`Sched::RegPressure` 只影响 SelectionDAG 的发射顺序。MachineInstr 的调度在指令选择之后：分配前一次，帧处理之后再一次，用的是 `XAISchedule.td` 里的顺序发射模型。PEI 仍是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。
 
 ```mermaid
 flowchart TD
   ir["LLVM IR"]
   legal["类型合法化与调用约定"]
   isel["SelectionDAG 指令选择"]
-  mi["MachineInstr，虚拟寄存器"]
+  miv["MachineInstr，虚拟寄存器"]
+  presched["分配前调度"]
   ra["寄存器分配与 spill"]
   pei["Prologue / Epilogue，帧索引消除"]
-  mc["MCInst"]
+  postsched["分配后调度"]
+  mi["MachineInstr，物理寄存器"]
   asm["AsmPrinter"]
   text["文本汇编"]
 
-  ir --> legal --> isel --> mi --> ra --> pei --> mc --> asm --> text
+  ir --> legal --> isel --> miv --> presched --> ra --> pei --> postsched --> mi --> asm --> text
 ```
 
 `XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 挂上 `XAIDAGToDAGISel`，其余 pass 使用 TargetPassConfig 的默认序列。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small，函数对齐是 4 字节。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
@@ -33,6 +35,8 @@ flowchart TD
 | 类型合法化 | 按合法类型拆分或提升非法类型 | `XAIISelLowering.cpp` 登记 `i64`、`v256f16`、`v256f32` |
 | 调用约定 | `CCState` 按 TableGen 规则分配位置 | `XAICallingConv.td` 的 `CC_XAI`，C++ 拒绝栈参数和非 `void` 返回 |
 | 指令选择 | SelectionDAG 匹配 `Pat`，Custom 节点调用 `LowerOperation` | `XAIInstrInfo.td`；访存和 `BR_CC` 在 C++ 中完成 |
+| 分配前调度 | `MachineScheduler`，`-O0` 不跑 | `XAISchedule.td` 的 `XAIModel`；`enableMachineScheduler` 返回 true |
+| 分配后调度 | `PostMachineScheduler`，`-O0` 不跑 | 同一模型；`XAIPassConfig` 用它替换旧的 `PostRAScheduler` |
 | 分支折叠 | BranchFolder 调用 `analyzeBranch` 等钩子 | `XAIInstrInfo.cpp` |
 | 寄存器分配 | 分配虚拟寄存器，必要时插入 spill | `copyPhysReg`，以及 `xai.st` / `xai.ld`、`xai.mstore.f32` / `xai.mload.f32` |
 | 栈帧 | PEI 调用 prologue、epilogue 和帧索引消除 | `XAIFrameLowering.cpp`、`XAIRegisterInfo::eliminateFrameIndex` |
@@ -133,7 +137,9 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 
 ### 3.3 指令选择
 
-选择器是 `XAIDAGToDAGISel`。`Select` 先处理 tile 访存 intrinsic，其余节点交给 TableGen 生成的 `SelectCode`。
+`llvm.xai.*` 在合法化阶段保持为通用 intrinsic 节点，不生成 `XAIISD` 节点，也不生成 `MachineInstr`。构建 DAG 时，`IntrNoMem` 的 `llvm.xai.mma` 成为 `ISD::INTRINSIC_WO_CHAIN`，读内存的 `mload` 成为 `ISD::INTRINSIC_W_CHAIN`，写内存的 `mstore` 成为 `ISD::INTRINSIC_VOID`。节点上带的是 intrinsic ID。`v256f16` 和 `v256f32` 已登记为合法类型，合法化不拆开这些节点。`LowerOperation` 只处理 `ISD::BR_CC`。本目标唯一的 target-specific DAG 节点是 `LowerReturn` 生成的 `XAIISD::RET_FLAG`。
+
+选择器是 `XAIDAGToDAGISel`。`Select` 先处理 tile 访存 intrinsic，其余节点交给 TableGen 生成的 `SelectCode`。`llvm.xai.mma` 由 `XAIInstrInfo.td` 的 `Pat` 选成 `XAI_MMA`。四条访存 intrinsic 带 chain，TableGen 的 `Pat` 匹配不上，由 `selectMemIntrinsic` 在 C++ 里选成对应的 `MachineInstr`。
 
 | DAG | 选择结果 | 实现位置 |
 |---|---|---|
@@ -196,7 +202,7 @@ objectOffset + stackSize + 原立即数 + SPAdj
 
 FP16 tile 若被 spill，使用的仍是 FP32 宽度的 `xai.mstore.f32` / `xai.mload.f32`。`xai.li` 标了 `isReMaterializable` 和 `isAsCheapAsAMove`，有符号 32 位常量在寄存器不够时可以重新物化。
 
-调度使用 `Sched::RegPressure` 和 `NoItineraries`。默认调度 pass 会运行，指令没有延迟或发射模型。
+`generic` 使用 `XAIModel`：顺序发射，每周期一条指令。延迟是相对代价，不是实测周期。GPR 运算、移动、立即数、GPR 访存和分支是 1；矩阵 load 和 `xai.mma` 是 4；矩阵 store 是 2。结果在延迟结束前不能被读，所以一条与乘加无关的地址加法可以插进矩阵 load 和 `xai.mma` 之间。`sched.ll` 锁住这个顺序；`-O0` 不调度，加法仍留在 store 之后。
 
 ### 3.5 MC 与汇编打印
 
@@ -276,6 +282,7 @@ xai.ret
 | `XAIRegisterInfo.td` | GPR、MR、编码与 DWARF 号 |
 | `XAICallingConv.td` | `CC_XAI` |
 | `XAIInstrInfo.td` | 指令、`Pat`、分支操作数 `brtarget` |
+| `XAISchedule.td` | `XAIModel`：发射宽度、延迟、`InstRW` |
 | `XAITargetMachine.cpp` | data layout、pass config、目标注册 |
 | `XAIISelLowering.cpp` | 合法类型、参数、返回、`BR_CC` |
 | `XAIISelDAGToDAG.cpp` | tile load/store 的自定义选择 |

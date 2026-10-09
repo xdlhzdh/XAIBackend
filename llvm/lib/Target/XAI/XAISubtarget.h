@@ -38,6 +38,8 @@ public:
 
   void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
 
+  bool enableMachineScheduler() const override { return true; }
+
   const XAIInstrInfo *getInstrInfo() const override { return &InstrInfo; }
   const XAITargetLowering *getTargetLowering() const override { return &TLInfo; }
   const XAIFrameLowering *getFrameLowering() const override {

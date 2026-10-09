@@ -11,6 +11,7 @@ include "llvm/Target/Target.td"
 include "XAIRegisterInfo.td"
 include "XAICallingConv.td"
 include "XAIInstrInfo.td"
+include "XAISchedule.td"
 
 defm : RemapAllTargetPseudoPointerOperands<GPR>;
 
@@ -21,7 +22,7 @@ def XAIAsmWriter : AsmWriter {
   bit isMCAsmWriter = 1;
 }
 
-def : Processor<"generic", NoItineraries, []>;
+def : ProcessorModel<"generic", XAIModel, []>;
 
 def XAI : Target {
   let InstructionSet = XAIInstrInfo;
