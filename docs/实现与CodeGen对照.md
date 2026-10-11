@@ -18,18 +18,16 @@ flowchart TD
   miv["MachineInstr，虚拟寄存器"]
   presched["分配前调度"]
   ra["寄存器分配与 spill"]
+  mi["MachineInstr，物理寄存器"]
   pei["Prologue / Epilogue，帧索引消除"]
   postsched["分配后调度"]
-  mi["MachineInstr，物理寄存器"]
   asm["AsmPrinter"]
   text["文本汇编"]
 
-  ir --> legal --> isel --> miv --> presched --> ra --> pei --> postsched --> mi --> asm --> text
+  ir --> legal --> isel --> miv --> presched --> ra --> mi --> pei --> postsched --> asm --> text
 ```
 
-`mi` 不是一个 pass。寄存器分配把虚拟寄存器换成物理寄存器，PEI 和分配后调度都改的是这些指令；`mi` 表示 AsmPrinter 读到的那份结果。
-
-`XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 加入 `XAIDAGToDAGISelLegacy`，它包装真正做选择的 `XAIDAGToDAGISel`，原因见 3.3；其余 pass 使用 TargetPassConfig 的默认序列。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small。`XAITargetLowering` 把函数对齐设为 4 字节。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
+图里有两份 `MachineInstr`。指令选择出来的用虚拟寄存器；寄存器分配换成物理寄存器。PEI 和分配后调度改的是这份物理寄存器指令，AsmPrinter 打印调度之后的结果。
 
 | 阶段 | LLVM 负责 | 本仓库中的实现 |
 |---|---|---|
@@ -140,7 +138,7 @@ flowchart TD
 `llc -mtriple=xai` 按下面的顺序进行。
 
 1. 启动时调用 1.1 的四个函数，把工厂和 pass 名写入注册表。这一步只做一次。
-2. 按 triple 创建 `XAITargetMachine`。构造函数同时创建成员 `XAISubtarget`，里面有 `XAIInstrInfo`、`XAIFrameLowering`、`XAITargetLowering`，并按 CPU 名 `generic` 找到 `XAIModel`。接着 `initAsmInfo` 从 `TargetRegistry` 取出 `MCRegisterInfo`、`MCInstrInfo`、`MCSubtargetInfo` 和 `MCAsmInfo`。
+2. 按 triple 创建 `XAITargetMachine`（继承 `CodeGenTargetMachineImpl`）。没有 `-mcpu` 时 CPU 名是 `generic`，没指定时重定位模型是 static、代码模型是 Small。构造函数同时创建成员 `XAISubtarget`，里面有 `XAIInstrInfo`、`XAIFrameLowering`、`XAITargetLowering`，并按这个 CPU 名找到 `XAIModel`。它还创建一个 ELF 的 `TargetLoweringObjectFile`，AsmPrinter 用它决定段怎么写。接着 `initAsmInfo` 从 `TargetRegistry` 取出 `MCRegisterInfo`、`MCInstrInfo`、`MCSubtargetInfo` 和 `MCAsmInfo`。
 3. `CodeGenTargetMachineImpl::addPassesToEmitFile` 搭建流水线，分三步，与上面的注册顺序无关：
    - `addPassesToGenerateCode` 调用 `createPassConfig`，得到 `XAIPassConfig`。它的构造函数用 `substitutePass` 把分配后调度从 `PostRAScheduler` 换成 `PostMachineScheduler`。框架按默认序列加 pass；加到指令选择时回调 `addInstSelector`，加入 `createXAIISelDag` 返回的 `XAIDAGToDAGISelLegacy`。
    - `addAsmPrinter` 从 `TargetRegistry` 取出 `XAIAsmPrinter` 的工厂，创建 pass 并加在代码生成 pass 之后。所以它是最后一个生成代码的 pass。
@@ -291,7 +289,7 @@ flowchart TD
 | `eliminateFrameIndex` | 见下文 |
 | `emitPrologue` / `emitEpilogue` | 栈大小非 0 时用 `xai.addi` 调整 `r31` |
 
-帧向下增长，栈对齐 1024 字节，局部区域偏移为 0，没有 frame pointer，也不能在运行时重新对齐（`StackRealignable=false`）。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
+帧向下增长，栈对齐 1024 字节，局部区域偏移为 0，没有 frame pointer，也不能在运行时重新对齐（`StackRealignable=false`）。函数代码的对齐是另一件事：`XAITargetLowering` 用 `setMinFunctionAlignment` 把它设为 4 字节。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
 
 栈帧大小由 PEI 的 `calculateFrameObjectOffsets` 计算，`emitPrologue` 和 `emitEpilogue` 只读取结果。它以进入函数时的 SP 为原点，按每个栈对象自己的大小和对齐往后排；对齐取整多出来的字节就是空隙，最后再按 1024 字节向上取整，得到 `StackSize`。这两个函数在 `StackSize` 为 0 时不插指令，否则分别插入 `xai.addi r31, r31, -StackSize` 和返回前的相反调整。入口 SP 按 1024 对齐是 ABI 假设，所以对象离原点的距离按它对齐，就等于地址按它对齐，不需要 frame pointer。
 
