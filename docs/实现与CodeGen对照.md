@@ -415,16 +415,27 @@ bb.2.body:
 
 #### 分支分析钩子
 
-`BranchFolder` 和 `MachineBlockPlacement` 不认识 XAI 的跳转指令。它们通过 `XAIInstrInfo` 的四个钩子读懂和改写基本块结尾：
+`BranchFolder`、`MachineBlockPlacement` 和尾复制等通用 pass 经常要改跳转：块换了顺序，原来跳到下一块的跳转就多余了；条件跳转的目标正好变成下一块，就要把条件取反。但这些 pass 不认识 XAI 的跳转指令。LLVM 的做法是定义一份与目标无关的跳转描述 `(TBB, FBB, Cond)`，再由目标提供四个钩子，在这份描述和真实指令之间相互转换：
 
-| 钩子 | 作用 |
-|---|---|
-| `analyzeBranch` | 从块尾往前识别最多两条跳转，给出条件跳转的目标 `TBB`、另一个目标 `FBB` 和条件 `Cond`。`Cond` 编码为 `[opcode, rs1, rs2]`。遇到 `xai.ret` 这类不认识的结尾返回 true，通用 pass 就不改这个块。`AllowModify` 为真时，顺手删除跳到下一块的 `xai.br` |
-| `removeBranch` | 删除块尾的所有跳转，按每条 4 字节报告删掉的长度 |
-| `insertBranch` | 按 `Cond` 重新生成条件跳转；有 `FBB` 时再加一条 `xai.br` |
-| `reverseBranchCondition` | 取反条件：`beq` ↔ `bne`，`bltu` ↔ `bgeu` |
+| 钩子 | 方向 | 作用 |
+|---|---|---|
+| `analyzeBranch` | 指令 → 描述 | 从块尾往前识别最多两条跳转，给出条件跳转的目标 `TBB`、条件不成立时显式跳去的块 `FBB`（为空表示顺序落到下一块）和条件 `Cond`。返回 false 表示分析成功，返回 true 表示失败，例如块以 `xai.ret` 结尾或末尾有两条条件跳转，这时通用 pass 不改这个块。`AllowModify` 为真时，顺手删除无条件跳转之后的死代码和跳到下一块的 `xai.br` |
+| `reverseBranchCondition` | 描述 → 描述 | 只改 `Cond[0]` 的 opcode：`beq` ↔ `bne`，`bltu` ↔ `bgeu`。同样是返回 false 表示成功 |
+| `removeBranch` | 删除指令 | 删除块尾的所有 `xai.br` 和条件跳转，返回删掉的条数，按每条 4 字节报告长度。它不改 `xai.ret` |
+| `insertBranch` | 描述 → 指令 | 在块尾生成跳转：`Cond` 为空时生成 `xai.br TBB`；否则生成 `Cond[0]` 指定的条件跳转，操作数是 `Cond[1]`、`Cond[2]` 和 `TBB`；有 `FBB` 时再接一条 `xai.br FBB` |
 
-不实现这些钩子时，`analyzeBranch` 的默认实现返回“看不懂”，两个 pass 都不会动 XAI 的跳转。
+`Cond` 是 XAI 自己定的格式 `[Imm(opcode), rs1, rs2]`，例如 `[XAI_BGEU, $r5, $r3]`。通用 pass 不解读它，只把它原样传回给 `reverseBranchCondition` 和 `insertBranch`，所以只要这几个钩子之间一致就行。
+
+**接口怎么接上。** 这四个函数是 LLVM 基类 `TargetInstrInfo` 里的虚函数。默认实现表示不支持：`analyzeBranch` 和 `reverseBranchCondition` 返回 true，`removeBranch` 和 `insertBranch` 直接 `llvm_unreachable`。`XAIInstrInfo.h` 用 `override` 重写了这四个函数。通用 pass 用 `MF.getSubtarget().getInstrInfo()` 取到 `const TargetInstrInfo *`，`XAISubtarget::getInstrInfo` 返回的就是它持有的 `XAIInstrInfo`，所以 `TII->analyzeBranch(...)` 这类调用经虚函数分派，执行的是 XAI 的实现。不重写时，`analyzeBranch` 永远失败，这些 pass 都不会动 XAI 的跳转。
+
+**怎么配合。** 通用 pass 改写一个块的跳转时，按“读出、修改、写回”的顺序调用：`analyzeBranch` 读出描述，pass 修改 `TBB` / `FBB`，需要时调用 `reverseBranchCondition` 取反 `Cond`，再用 `removeBranch` 删掉旧跳转，最后用 `insertBranch` 在块尾写入新跳转。跳转始终位于块尾，删除只是为了给新跳转腾位置。例如块 A 末尾是 `xai.beq r1, r2, B` 加 `xai.br C`，块排布把 B 挪到 A 的正后方后，`MachineBasicBlock::updateTerminator` 会这样改写：
+
+1. `analyzeBranch(A)` 得到 `TBB = B`，`FBB = C`，`Cond = [XAI_BEQ, r1, r2]`。
+2. 发现 `TBB` 就是下一块，调用 `reverseBranchCondition`，`Cond` 变成 `[XAI_BNE, r1, r2]`。
+3. `removeBranch(A)` 删掉原来的两条跳转。
+4. `insertBranch(A, C, nullptr, Cond)` 生成 `XAI_BNE $r1, $r2, %bb.C`，AsmPrinter 最后按 `.td` 里的汇编字符串打印成 `xai.bne r1, r2, C` 的形式。
+
+两条跳转变成一条，语义不变：不相等跳 C，相等时顺序落到 B。
 
 #### 删除跳到下一块的跳转
 
@@ -432,7 +443,21 @@ PEI 之后、分配后调度之前，`BranchFolder` 对每个块调用 `analyzeB
 
 #### 循环回边
 
-分配后调度之后，`MachineBlockPlacement` 重新排布基本块。header 只剩一条比较跳转，复制它的代价很小，所以这个 pass 在 `-O2` 下做尾复制：把 header 复制进它的两个前驱，然后删掉 header。
+回边是从循环的最后一个块跳回循环开头的那条边。分支折叠之后，`loop.ll` 的循环是：
+
+```
+bb.1.header:
+  XAI_BGEU $r5, $r3, %bb.3             // i >= n 跳 exit，否则顺序落到 body
+bb.2.body:
+  ...
+  XAI_BR %bb.1                         // 回边：body → header
+bb.3.exit:
+  XAI_RET
+```
+
+每一轮都要先从 body 跳回 header，在 header 判断后再落回 body，执行 `xai.br` 和 `xai.bgeu` 两条跳转。
+
+分配后调度之后，`MachineBlockPlacement` 重新排布基本块。header 只剩一条比较跳转，复制它的代价很小，所以这个 pass 在 `-O2` 下做尾复制：把 header 复制进它的两个前驱 entry 和 body，然后删掉 header。
 
 ```
 bb.0.entry:
@@ -440,12 +465,24 @@ bb.0.entry:
   XAI_BGEU $r5, $r3, %bb.3             // 复制进入口：第一次进入前判断
 bb.2.body:
   ...
-  XAI_BLTU $r5, $r3, %bb.2             // 复制进循环尾：条件取反后跳回 body
+  XAI_BLTU $r5, $r3, %bb.2             // 复制进循环尾：回边变成 body → body
 bb.3.exit:
   XAI_RET
 ```
 
-复制进 body 尾部时，原来的语义是 `i >= n` 跳到 exit，否则回 body。exit 被排在 body 后面，于是 pass 调用 `reverseBranchCondition`，把 `BGEU` 改成 `BLTU`：`i < n` 跳回 body，否则顺序落到 exit。原来回 header 的 `XAI_BR %bb.1` 也不再需要。最后每轮只执行回边上的一条 `xai.bltu`。
+复制进 body 尾部时，原来的语义是 `i >= n` 跳到 exit，否则回 body。exit 被排在 body 后面，于是 `updateTerminator` 按上面的“读出、修改、写回”改写 body 的结尾：`analyzeBranch` 得到 `TBB = exit`、`FBB = body`、`Cond = [XAI_BGEU, $r5, $r3]`；`TBB` 是下一块，`reverseBranchCondition` 把条件改成 `XAI_BLTU`；`removeBranch` 删掉旧跳转；`insertBranch` 生成 `XAI_BLTU $r5, $r3, %bb.2`。结果是 `i < n` 跳回 body 开头，否则顺序落到 exit。原来回 header 的 `XAI_BR %bb.1` 也不再需要，每轮只执行回边上的一条 `xai.bltu`。
+
+判断从循环头部移到了循环尾部，这是循环旋转（loop rotation）的效果。跳转始终在块尾，回边上的 `xai.bltu` 位于 body 末尾，它的目标是 body 的入口。
+
+`llvm/lib/Target/XAI` 里没有任何循环相关的代码。识别循环、尾复制、排布基本块都是 `MachineBlockPlacement` 做的；XAI 提供的是上面四个钩子，让这个 pass 能读写 XAI 的跳转。用 `-print-before=block-placement` 和 `-print-after=block-placement` 可以看到这一步前后的变化。用 `-debug-only=codegen,tailduplication` 能看到具体过程：
+
+```
+*** Tail-duplicating %bb.1
+Tail-duplicating into PredBB: bb.2.body:
+Updating terminators on %bb.2
+Updating terminators on %bb.0
+TailDuplicator deleted block: %bb.1 ('header')
+```
 
 `-O0` 不跑这两个 pass。汇编里保留 header，每个跳到下一块的地方都有一条 `xai.br`，每轮执行三条跳转。
 
