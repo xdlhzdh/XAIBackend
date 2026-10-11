@@ -228,9 +228,13 @@ flowchart TD
 
 `llvm.xai.*` 在合法化阶段保持为通用 intrinsic 节点，不生成 `XAIISD` 节点，也不生成 `MachineInstr`。构建 DAG 时，`IntrNoMem` 的 `llvm.xai.mma` 成为 `ISD::INTRINSIC_WO_CHAIN`，读内存的 `mload` 成为 `ISD::INTRINSIC_W_CHAIN`，写内存的 `mstore` 成为 `ISD::INTRINSIC_VOID`。节点上带的是 intrinsic ID。`v256f16` 和 `v256f32` 已登记为合法类型，合法化不拆开这些节点。`LowerOperation` 只处理 `ISD::BR_CC`。本目标唯一的 target-specific DAG 节点是 `LowerReturn` 生成的 `XAIISD::RET_FLAG`。
 
-选择逻辑和 pass 包装是两个类。`XAIDAGToDAGISel` 继承 `SelectionDAGISel`，只负责选择，不实现 pass 接口。`XAIDAGToDAGISelLegacy` 继承 `SelectionDAGISelLegacy`，是旧 pass 管理器里的 `FunctionPass`：它持有一个 `XAIDAGToDAGISel`，被调用时把工作转过去。LLVM 这样拆，是为了让同一套选择逻辑适配新旧两种 pass 管理器；新 pass 管理器对应的包装是 `SelectionDAGISelPass`。XAI 只写了旧包装，`llc` 默认走这条路径。`createXAIISelDag` 返回的是 `XAIDAGToDAGISelLegacy`。`INITIALIZE_PASS` 登记的名字 `xai-isel` 也属于这个包装类，见 1.1。
+选择逻辑和 pass 包装是两个类。`XAIDAGToDAGISel` 继承 `SelectionDAGISel`，只负责选择，不实现 pass 接口。`XAIDAGToDAGISelLegacy` 继承 `SelectionDAGISelLegacy`，是旧 pass 管理器里的 `MachineFunctionPass`：它持有一个 `XAIDAGToDAGISel`，被调用时把工作转过去。LLVM 这样拆，是为了让同一套选择逻辑适配新旧两种 pass 管理器；新 pass 管理器对应的包装是 `SelectionDAGISelPass`。XAI 只写了旧包装，`llc` 默认走这条路径。`createXAIISelDag` 返回的是 `XAIDAGToDAGISelLegacy`。`INITIALIZE_PASS` 登记的名字 `xai-isel` 也属于这个包装类，见 1.1。
 
-`Select` 先处理 tile 访存 intrinsic，其余节点交给 TableGen 生成的 `SelectCode`。`llvm.xai.mma` 由 `XAIInstrInfo.td` 的 `Pat` 选成 `XAI_MMA`。四条访存 intrinsic 带 chain，TableGen 的 `Pat` 匹配不上，由 `selectMemIntrinsic` 在 C++ 里选成对应的 `MachineInstr`。
+选择的主体是 TableGen 生成的 `XAIGenDAGISel.inc`，它被 `#include` 进 `XAIDAGToDAGISel`，提供匹配表和 `SelectCode`。`Select` 在基类里是纯虚函数，目标必须实现，它是每个节点的选择入口。XAI 的 `Select` 依次做三件事：
+
+1. 节点已经是机器节点（`isMachineOpcode()`）时直接跳过。`LowerBR_CC` 在合法化阶段就生成了 `XAI_BGEU` 这类机器节点，不能再拿去匹配，见下面的比较跳转。
+2. 四条 tile 访存 intrinsic 由 `selectMemIntrinsic` 在 C++ 里选成对应的机器节点。
+3. 其余节点交给 `SelectCode`。`llvm.xai.mma` 由 `XAIInstrInfo.td` 的 `Pat` 选成 `XAI_MMA`。
 
 | DAG | 选择结果 | 实现位置 |
 |---|---|---|
@@ -243,7 +247,16 @@ flowchart TD
 | `br` | `XAI_BR` | 指令自身的 pattern |
 | `brcond` + `setcc`，DAGCombiner 合成 `br_cc` | `XAI_BEQ` / `XAI_BNE` / `XAI_BLTU` / `XAI_BGEU` | 合法化时由 `LowerBR_CC` 生成，见下面的比较跳转 |
 
-带 chain 的 load/store intrinsic 在 TableGen 里带未建模副作用，`Pat` 匹配不上，所以在 C++ 里选择。偏移立即数固定为 0；指针算术在 load 之前用 `xai.add` 或 `xai.addi` 完成，见下面的地址步进。
+`selectMemIntrinsic` 取出 chain、指针和要写的值，补上偏移立即数 0，再用 `SelectNodeTo` 把节点换成 `XAI_MLOAD_*` / `XAI_MSTORE_*`。指针算术在 load 之前用 `xai.add` 或 `xai.addi` 完成，见下面的地址步进。
+
+这段 C++ 不是必须的。TableGen 能匹配带 chain 的 intrinsic，例如：
+
+```tablegen
+def : Pat<(v256f16 (int_xai_mload_f16 GPR:$base)), (XAI_MLOAD_F16 GPR:$base, 0)>;
+def : Pat<(int_xai_mstore_f16 GPR:$base, MR:$v), (XAI_MSTORE_F16 MR:$v, GPR:$base, 0)>;
+```
+
+把四条这样的 `Pat` 加进 `XAIInstrInfo.td`，再跑 `llvm-tblgen -gen-dag-isel`，生成的匹配表会先用 `OPC_RecordNode` 记录带 chain 的节点，用 `OPC_EmitMergeInputChains1_0` 接上输入 chain，再用 `OPC_MorphNodeTo1Chain` / `OPC_MorphNodeTo0Chain` 换成机器节点，和 `selectMemIntrinsic` 做的事相同。需要手写 C++ 的是 `Pat` 表达不了的情况，例如用 `ComplexPattern` 声明的复杂寻址模式，或者要按条件展开成多条指令。
 
 #### 地址步进
 
