@@ -36,7 +36,7 @@ flowchart TD
 | 调用约定 | `CCState` 按 TableGen 规则分配位置 | `XAICallingConv.td` 的 `CC_XAI`，C++ 拒绝栈参数和非 `void` 返回 |
 | 指令选择 | SelectionDAG 匹配 `Pat`，Custom 节点调用 `LowerOperation` | `XAIInstrInfo.td`；访存和 `BR_CC` 在 C++ 中完成 |
 | 分配前调度 | `MachineScheduler`，`-O0` 不跑 | `XAISchedule.td` 的 `XAIModel`；`enableMachineScheduler` 返回 true |
-| 分配后调度 | `PostMachineScheduler`，`-O0` 不跑 | 同一模型；`XAIPassConfig` 用它替换旧的 `PostRAScheduler` |
+| 分配后调度 | `PostMachineScheduler`，`-O0` 不跑 | 同一模型；`substitutePass` 替换旧的 `PostRAScheduler`，见 3.4 |
 | 分支折叠 | BranchFolder 调用 `analyzeBranch` 等钩子 | `XAIInstrInfo.cpp` |
 | 寄存器分配 | 分配虚拟寄存器，必要时插入 spill | `copyPhysReg`，以及 `xai.st` / `xai.ld`、`xai.mstore.f32` / `xai.mload.f32` |
 | 栈帧 | PEI 调用 prologue、epilogue 和帧索引消除 | `XAIFrameLowering.cpp`、`XAIRegisterInfo::eliminateFrameIndex` |
@@ -140,7 +140,7 @@ flowchart TD
 1. 启动时调用 1.1 的四个函数，把工厂和 pass 名写入注册表。这一步只做一次。
 2. 按 triple 创建 `XAITargetMachine`（继承 `CodeGenTargetMachineImpl`）。没有 `-mcpu` 时 CPU 名是 `generic`，没指定时重定位模型是 static、代码模型是 Small。构造函数同时创建成员 `XAISubtarget`，里面有 `XAIInstrInfo`、`XAIFrameLowering`、`XAITargetLowering`，并按这个 CPU 名找到 `XAIModel`。它还创建一个 ELF 的 `TargetLoweringObjectFile`，AsmPrinter 用它决定段怎么写。接着 `initAsmInfo` 从 `TargetRegistry` 取出 `MCRegisterInfo`、`MCInstrInfo`、`MCSubtargetInfo` 和 `MCAsmInfo`。
 3. `CodeGenTargetMachineImpl::addPassesToEmitFile` 搭建流水线，分三步，与上面的注册顺序无关：
-   - `addPassesToGenerateCode` 调用 `createPassConfig`，得到 `XAIPassConfig`。它的构造函数用 `substitutePass` 把分配后调度从 `PostRAScheduler` 换成 `PostMachineScheduler`。框架按默认序列加 pass；加到指令选择时回调 `addInstSelector`，加入 `createXAIISelDag` 返回的 `XAIDAGToDAGISelLegacy`。
+   - `addPassesToGenerateCode` 调用 `createPassConfig`，得到 `XAIPassConfig`。它的构造函数用 `substitutePass` 替换分配后调度用的 pass，原因见 3.4。框架按默认序列加 pass；加到指令选择时回调 `addInstSelector`，加入 `createXAIISelDag` 返回的 `XAIDAGToDAGISelLegacy`。
    - `addAsmPrinter` 从 `TargetRegistry` 取出 `XAIAsmPrinter` 的工厂，创建 pass 并加在代码生成 pass 之后。所以它是最后一个生成代码的 pass。
    - 最后加入 `Free MachineFunction`，释放每个函数的 `MachineFunction`。`llc -debug-pass=Structure` 的末尾就是 `XAI Assembly Printer`、`Free MachineFunction`。
 4. 对每个函数跑这条流水线。轮到指令选择时，pass 管理器调用 `XAIDAGToDAGISelLegacy`，它把每个 DAG 节点交给内部的 `XAIDAGToDAGISel::Select`。之后的 pass 通过 `MF.getSubtarget()` 取得同一个 `XAISubtarget`，再取出寄存器、指令、栈帧和调度模型。
@@ -260,20 +260,34 @@ flowchart TD
 
 ### 3.4 指令调度
 
-两次调度都读 `XAIModel`，由框架完成依赖图和发射时间的计算。XAI 只提供这张表，并打开两个开关：`enableMachineScheduler` 返回 true；`XAIPassConfig` 用 `substitutePass` 把旧的 `PostRAScheduler` 换成 `PostMachineScheduler`。`-O0` 两者都不跑。
+XAI 不写调度算法。分配前的 pass 是 `MachineScheduler`，分配后的 pass 是 `PostMachineScheduler`。两个 pass 都自己建依赖图：用 `XAIModel` 给每条边标延迟，再算出每条指令的最早发射周期，然后重排基本块里的指令。重排时 pass 调用一个策略对象，由它决定新的顺序。XAI 没有更换策略，所以分配前用默认的 `GenericScheduler`，分配后用默认的 `PostGenericScheduler`。策略不再计算边的延迟，只使用依赖图里已经算好的发射周期。
+
+`XAIModel` 是顺序、单发射模型（`IssueWidth = 1`，`MicroOpBufferSize = 0`），只有一条流水线 `XAIPipe`。`CompleteModel = 1`，所以每条指令，包括 `COPY`，都要有 `InstRW`。延迟是相对代价，不是实测周期：GPR 运算、移动、立即数、GPR 访存和分支是 1，矩阵 load 和 `xai.mma` 是 4，矩阵 store 是 2。
+
+依赖图里一个节点是一条指令。后一条读前一条写出的寄存器时，连一条数据依赖边，延迟等于生产者在 `XAIModel` 里的延迟，也就是结果写完后要过多久才能被读。`xai.mload.f32` 到 `xai.mma` 的边是 4。`xai.mstore` 不写寄存器，它的 2 不会变成这种边；和其他指令之间只有内存顺序约束，框架给 store 之后的 load 用固定延迟 1，不查 `XAIModel`。XAI 没有 `ReadAdvance`。一条指令的最早发射周期，是它所有前驱的“发射周期加边延迟”里的最大值。`IssueWidth = 1` 再限制每个周期只能发射一条。
+
+寄存器压力是某一时刻还要占着物理寄存器的值有多少。一个虚拟寄存器从定义活到最后一次使用，这整段都算一个。GPR 同时能放下 `r0`–`r30` 共 31 个，MR 是 `m0`–`m7` 共 8 个。某一类同时活着的值多于这个数，多出来的值到寄存器分配时就只能 spill 到栈上。压力就是这个同时存活的个数离上限有多近。`GenericScheduler` 不把值写到栈上，它只通过重排尽量不让个数超过上限。真的超过时，后面的寄存器分配才插入 spill：调用 `storeRegToStackSlot` / `loadRegFromStackSlot`，生成带帧索引的 `xai.mstore.f32` / `xai.mload.f32`。PEI 再给这些槽算偏移，并在函数入口和返回前调整 `r31`，见 3.5。`spill.ll` 让 9 个矩阵值同时存活，迫使至少一次 spill；`sched.ll` 没有超过上限，没有栈调整。
+
+`GenericScheduler` 重排时先看这一步会不会加重压力。把一个值的定义提前、使用留在后面，它活得更久，中间同时活着的值就更多。所以会让某一类超过上限的指令往后放，把定义挪到靠近使用的地方，缩短存活区间。没有超过上限，再把处在更长依赖链上的指令往前放。`sched.ll` 里，`MachineScheduler` 只把 `%3 = COPY $r3` 挪到靠近 `XAI_ADDI` 的位置，`%3` 不必活过前面的矩阵运算，GPR 的同时存活数下降。它没有把 `XAI_ADDI` 提到 `XAI_MMA` 前面：那样加法的结果要一直活到后面的使用，压力反而升高，load 的等待就填不上。
+
+`PostGenericScheduler` 不再看这份额。到了 `PostMachineScheduler`，寄存器已经是物理寄存器，spill 也已经插入。重排时，它只把依赖和物理寄存器复用都允许、并且最早发射周期已经到了的指令往前放，等待更少的更靠前。同一段代码里，`xai.addi` 写入的物理寄存器当时已经没有人再读，就把它提到 `xai.mma` 前面，填上 load 的 4 周期等待。`-O0` 两个 pass 都不跑，加法仍留在 store 之后。
 
 | | 分配前 `MachineScheduler` | 分配后 `PostMachineScheduler` |
 |---|---|---|
 | 位置 | 寄存器合并之后、分配之前 | PEI、分支折叠和 `ExpandPostRAPseudos` 之后，块排布之前 |
 | 看到的寄存器 | 虚拟寄存器 | 已经分配好的物理寄存器 |
-| 目标 | 兼顾延迟和寄存器压力。排得太散会让更多值同时存活，增加 spill | 只缩短停顿。寄存器已经定死，不再考虑 spill |
+| 重排策略 | `GenericScheduler`：先避免存活数超过物理寄存器个数，再用已算好的发射周期 | `PostGenericScheduler`：不再管存活数，只用已算好的发射周期 |
 | 额外约束 | 数据依赖和内存依赖 | 同一个物理寄存器被重复使用时，写不能越过尚未读完的旧值 |
 
-`XAIModel` 是顺序、单发射模型（`IssueWidth = 1`，`MicroOpBufferSize = 0`）。`CompleteModel = 1`，所以每条指令，包括 `COPY`，都要有 `InstRW`。延迟是相对代价，不是实测周期：GPR 运算、移动、立即数、GPR 访存和分支是 1，矩阵 load 和 `xai.mma` 是 4，矩阵 store 是 2。
+两次调度在默认流水线里已经各有一个槽位，打开的方式不同。
 
-框架建依赖图时，寄存器数据依赖边的延迟等于**生产者**的延迟，也就是结果写完后要过多久才能被读。`xai.mload.f32` 到 `xai.mma` 的边是 4，因为 load 写出矩阵寄存器。`xai.mstore` 不写寄存器，它的 2 不会变成这种边；和其他指令之间只有内存顺序约束，框架给 store 之后的 load 用固定延迟 1。XAI 没有 `ReadAdvance`，也没有自己的调度算法：最早发射周期和选下一条指令都由 `GenericScheduler` 计算。
+分配前的槽位就是 `MachineScheduler`。优化级别不是 `-O0` 时，框架在寄存器合并之后加入它。它真正重排指令还要求 `enableMachineScheduler()` 返回 true，XAI 在 `XAISubtarget` 里这样实现。`-O0` 走快速寄存器分配，这个 pass 不会加入。
 
-`sched.ll` 里把地址加法提到 `xai.mma` 前面的是分配后调度。分配前调度只把一个 `COPY` 挪到靠近它的使用者的地方，缩短虚拟寄存器的存活范围。加法与 `xai.mma` 没有数据依赖，而它写入的物理寄存器此时已经没有人再读，所以可以填进 load 的等待空隙。`-O0` 不调度，加法仍留在 store 之后。
+分配后的槽位默认放的是旧的 `PostRAScheduler`。它按指令行程（itinerary）调度，不读 `XAIModel` 里的 `InstRW`。XAI 没有 itinerary，延迟都写在 `XAIModel` 里，所以这个槽位要换成和分配前同一套实现的 `PostMachineScheduler`。
+
+`substitutePass` 是 `TargetPassConfig` 提供的方法，XAI 没有重写。`XAIPassConfig` 的构造函数在优化级别不是 `-O0` 时调用 `substitutePass(&PostRASchedulerID, &PostMachineSchedulerID)`。它只在一张表里登记一条替换：以后框架执行 `addPass(PostRAScheduler)` 时，实际加入 `PostMachineScheduler`。槽位仍在 PEI、分支折叠和伪指令展开之后，替换不改变这个位置。`-O0` 时框架本来就不会加入这个槽位。
+
+换上的 pass 还会再查一次开关。`enablePostRAMachineScheduler()` 的默认实现是 `enableMachineScheduler()` 并且调度模型的 `PostRAScheduler` 位为 1。XAI 两处都打开了，`XAISchedule.td` 里 `let PostRAScheduler = 1`。只替换 pass、不打开这一位，pass 会加入流水线但立刻返回，不做重排。反过来，只打开这一位、不调用 `substitutePass`，跑的仍是不读 `XAIModel` 的旧调度器。
 
 本目标不插入 `nop`，也不做冒险识别。调度只改变顺序；硬件被假定会在结果未就绪时自行停顿，所以 `-O0` 的结果仍然正确。
 
