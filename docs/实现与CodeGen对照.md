@@ -8,7 +8,7 @@ XAI 是教学用目标，架构名 `xai`。LLVM 的 OS 类型里已经占用了 
 
 ## 1. 流水线
 
-XAI 与通用 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、MachineScheduler、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、调度模型、分配与栈帧钩子、MC 打印。`Sched::RegPressure` 只影响 SelectionDAG 在指令选择期间的发射顺序，不影响后面的 MachineScheduler。MachineInstr 的调度有两次，用的都是 `XAISchedule.td` 里的顺序发射模型：一次在寄存器分配前，一次在 PEI、分支折叠和伪指令展开之后。PEI 是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。下图只画主要阶段，寄存器合并、分支折叠、伪指令展开和块排布没有单独列出。
+XAI 与通用 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、MachineScheduler、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、调度模型、分配与栈帧钩子、MC 打印。`Sched::RegPressure` 只影响 SelectionDAG 在指令选择期间的发射顺序，不影响后面的 MachineScheduler。MachineInstr 的调度有两次，用的都是 `XAISchedule.td` 里的顺序发射模型：一次在寄存器分配前，一次在 PEI、分支折叠和伪指令展开之后。PEI 是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。下图只画主要阶段，寄存器合并、尾复制和拷贝传播等 pass 没有单独列出。`-O0` 下只跑伪指令展开，不跑分支折叠和块排布。
 
 ```mermaid
 flowchart TD
@@ -20,14 +20,17 @@ flowchart TD
   ra["寄存器分配与 spill"]
   mi["MachineInstr，物理寄存器"]
   pei["Prologue / Epilogue，帧索引消除"]
+  branchfold["分支折叠"]
+  pseudo["伪指令展开"]
   postsched["分配后调度"]
+  placement["块排布"]
   asm["AsmPrinter"]
   text["文本汇编"]
 
-  ir --> legal --> isel --> miv --> presched --> ra --> mi --> pei --> postsched --> asm --> text
+  ir --> legal --> isel --> miv --> presched --> ra --> mi --> pei --> branchfold --> pseudo --> postsched --> placement --> asm --> text
 ```
 
-图里有两份 `MachineInstr`。指令选择出来的用虚拟寄存器；寄存器分配换成物理寄存器。PEI 和分配后调度改的是这份物理寄存器指令，AsmPrinter 打印调度之后的结果。
+图里有两份 `MachineInstr`。指令选择出来的用虚拟寄存器；寄存器分配换成物理寄存器。PEI 之后的各步改的都是这份物理寄存器指令：分支折叠删掉跳到下一块的跳转，伪指令展开把剩下的 `COPY` 换成 `xai.mov` / `xai.mmov`，块排布重排基本块并整理循环回边。AsmPrinter 打印块排布之后的结果。
 
 | 阶段 | LLVM 负责 | 本仓库中的实现 |
 |---|---|---|
@@ -37,7 +40,8 @@ flowchart TD
 | 指令选择 | SelectionDAG 匹配 `Pat`，Custom 节点调用 `LowerOperation` | `XAIInstrInfo.td`；访存和 `BR_CC` 在 C++ 中完成 |
 | 分配前调度 | `MachineScheduler`，`-O0` 不跑 | `XAISchedule.td` 的 `XAIModel`；`enableMachineScheduler` 返回 true |
 | 分配后调度 | `PostMachineScheduler`，`-O0` 不跑 | 同一模型；`substitutePass` 替换旧的 `PostRAScheduler`，见 3.4 |
-| 分支折叠 | BranchFolder 调用 `analyzeBranch` 等钩子 | `XAIInstrInfo.cpp` |
+| 分支折叠与块排布 | `BranchFolder`（PEI 之后）和 `MachineBlockPlacement`（分配后调度之后）调用 `analyzeBranch` 等钩子，`-O0` 不跑 | `XAIInstrInfo.cpp` 的四个分支钩子，见 3.3 |
+| 伪指令展开 | `ExpandPostRAPseudos` 在分配后调度之前展开 `COPY` 等通用伪指令；源和目的是同一个寄存器的拷贝直接删除 | `XAIInstrInfo::copyPhysReg`，见 3.5 和 4.3 |
 | 寄存器分配 | 分配虚拟寄存器，必要时插入 spill | `copyPhysReg`，以及 `xai.st` / `xai.ld`、`xai.mstore.f32` / `xai.mload.f32` |
 | 栈帧 | PEI 调用 prologue、epilogue 和帧索引消除 | `XAIFrameLowering.cpp`、`XAIRegisterInfo::eliminateFrameIndex` |
 | 汇编打印 | AsmPrinter 把 `MachineInstr` 降成 `MCInst`，送到 MC 流 | `XAIAsmPrinter.cpp`、`XAIMCInstLower.cpp`、`XAIInstPrinter.cpp` |
@@ -237,17 +241,155 @@ flowchart TD
 | `add`，一操作数为有符号 32 位立即数 | `XAI_ADDI` | `Pat`，立即数谓词 `XAISimm32` |
 | 有符号 32 位常量 | `XAI_LI` | `Pat` |
 | `br` | `XAI_BR` | 指令自身的 pattern |
-| `brcond` + `setcc` | `XAI_BEQ` / `XAI_BNE` / `XAI_BLTU` / `XAI_BGEU` | `LowerBR_CC` |
+| `brcond` + `setcc`，DAGCombiner 合成 `br_cc` | `XAI_BEQ` / `XAI_BNE` / `XAI_BLTU` / `XAI_BGEU` | 合法化时由 `LowerBR_CC` 生成，见下面的比较跳转 |
 
-带 chain 的 load/store intrinsic 在 TableGen 里带未建模副作用，`Pat` 匹配不上，所以在 C++ 里选择。偏移立即数固定为 0；指针算术在 load 之前用 `xai.add` 或 `xai.addi` 完成。
+带 chain 的 load/store intrinsic 在 TableGen 里带未建模副作用，`Pat` 匹配不上，所以在 C++ 里选择。偏移立即数固定为 0；指针算术在 load 之前用 `xai.add` 或 `xai.addi` 完成，见下面的地址步进。
 
-`getelementptr i8` 在 `shouldPreservePtrArith` 关闭时降成 `ISD::ADD`，与整数加法共用模式。元素大小为 1 的常量偏移，只要落在有符号 32 位以内，就选 `xai.addi`。更大的元素类型会先生成 `shl` 或 `mul`，这两条运算没有选择模式。
+#### 地址步进
 
-条件分支的路径如下。
+`loop.ll` 每轮用 `getelementptr i8, ptr %ap, i64 512` 让指针前进。`shouldPreservePtrArith` 默认返回 false，XAI 没有重写，所以 SelectionDAGBuilder 把它降成普通的 `ISD::ADD`，和整数加法共用 `XAIInstrInfo.td` 里的模式：
 
-1. `CondBr` 在 SelectionDAGBuilder 里变成 `SETCC` 与 `BRCOND`，假分支再接一条 `BR`。
-2. `ISD::BRCOND` 的动作是 Expand。操作数是 `SETCC` 且比较类型为 `i64` 时，展开为 `ISD::BR_CC`。
-3. `ISD::BR_CC` 对 `i64` 是 Custom。`LowerBR_CC` 按条件码生成一条比较跳转。基本块的类型也是 `MVT::Other`，指令发射器只把最后一个 `Other` 操作数当作 chain，所以机器节点的操作数顺序是比较的两端、目标块，最后才是 chain。
+```
+def XAISimm32 : PatLeaf<(imm), [{ return isInt<32>(N->getSExtValue()); }]>;
+def : Pat<(add GPR:$rs1, GPR:$rs2), (XAI_ADD GPR:$rs1, GPR:$rs2)>;
+def : Pat<(add GPR:$rs, XAISimm32:$imm), (XAI_ADDI GPR:$rs, XAISimm32:$imm)>;
+def : Pat<(i64 XAISimm32:$imm), (XAI_LI XAISimm32:$imm)>;
+```
+
+`XAISimm32` 只接受有符号 32 位以内的常量。步长 512 和 1024 满足条件，选成 `xai.addi`；下标的步长 `%step` 在寄存器里，选成 `xai.add`；下标初值 0 选成 `xai.li`。只有元素大小为 1 时，GEP 的下标才直接是字节偏移。更大的元素类型会先生成 `shl` 或 `mul`，这两条运算没有选择模式。`XAI_ADDI` 标了 `isAsCheapAsAMove`，通用 pass 把它看作和拷贝一样便宜。
+
+#### 比较跳转
+
+XAI 没有标志寄存器，比较和跳转是同一条指令，例如 `xai.bgeu rs1, rs2, target`：`rs1 >= rs2`（无符号）就跳。LLVM IR 和 SelectionDAG 里，比较和跳转一开始是分开的，这一节说明它们怎么合成一条 XAI 指令。
+
+先说清楚涉及的几个名字：
+
+| 名字 | 所在层 | 含义 |
+|---|---|---|
+| `CondBrInst` | LLVM IR | 条件分支 `br i1 %c, label %T, label %F`。LLVM 23 把原来的 `BranchInst` 拆成 `UncondBrInst` 和 `CondBrInst`，SelectionDAGBuilder 用 `visitCondBr` 处理后者 |
+| `ISD::SETCC` | SelectionDAG 通用节点 | 比较两个值，结果是布尔值。操作数为 `lhs, rhs, 条件码` |
+| 条件码 `ISD::CondCode` | SelectionDAG | `SETEQ`、`SETNE`、`SETULT`、`SETUGE` 等。`U` 表示无符号比较 |
+| `ISD::BRCOND` | SelectionDAG 通用节点 | 按一个布尔值跳转。操作数为 `chain, cond, 目标块` |
+| `ISD::BR` | SelectionDAG 通用节点 | 无条件跳转。操作数为 `chain, 目标块` |
+| `ISD::BR_CC` | SelectionDAG 通用节点 | 比较和跳转合成一个节点。操作数为 `chain, 条件码, lhs, rhs, 目标块` |
+| `XAI_BEQ` / `XAI_BNE` / `XAI_BLTU` / `XAI_BGEU` | XAI 机器节点 | XAI 的比较跳转指令，定义在 `XAIInstrInfo.td` |
+| `LowerBR_CC` | XAI 的 C++ 函数 | 把一个 `BR_CC` 换成对应的 XAI 比较跳转 |
+
+**chain 是什么。** SelectionDAG 是一张图，不是指令列表，节点之间本身没有先后顺序。普通运算靠数据边排序：`mma` 用到 load 的结果，就必须排在 load 后面。但读写内存和跳转这类有副作用的操作，彼此之间往往没有数据依赖：先 store 再跳转，跳转并不读 store 的结果。如果没有别的约束，它们可能被排反。chain 就是专门为它们加的顺序边：
+
+- chain 是一种特殊的值，类型是 `MVT::Other`，DAG 打印里写作 `ch`。
+- 有副作用的节点把一个 chain 当作第一个操作数，表示“在它之后执行”；同时再输出一个新的 chain，交给下一个有副作用的节点。
+- 每个基本块的 DAG 从 `EntryToken`（`t0`）开始，它是这条链的起点。
+- 多条链要汇合时，用 `TokenFactor` 合成一个 chain，表示“这些都完成之后”。
+
+`loop.ll` 的 body 块在构建 DAG 时是：
+
+```
+t0: ch,glue = EntryToken
+t4: v256f16,ch = llvm.xai.mload.f16 t0, ..., t3        // 第 1 个 load，接在 t0 后面
+t7: v256f16,ch = llvm.xai.mload.f16 t4:1, ..., t6      // 第 2 个 load，接在 t4 输出的 chain 后面
+t11: v256f32,ch = llvm.xai.mload.f32 t7:1, ..., t10    // 第 3 个 load
+t13: v256f32 = llvm.xai.mma ..., t4, t7, t11            // 没有副作用，不在链上，只靠数据边
+t15: ch = llvm.xai.mstore.f32 t11:1, ..., t10, t13     // store 接在第 3 个 load 后面
+t19 / t22 / t26 / t33: ch = CopyToReg t0, ...          // 写回下一轮要用的指针和下标
+t35: ch = TokenFactor t19, t22, t26, t33, t15          // 等这些都完成
+t36: ch = br t35, BasicBlock:ch<header>                // 跳转排在最后
+```
+
+`t4:1` 表示节点 `t4` 的第 2 个输出，也就是它输出的 chain。所以 `brcond` 的操作数 `chain, cond, 目标块` 的意思是：等 chain 代表的副作用都完成，按布尔值 `cond` 决定是否跳到目标块。header 里的 `t12: ch = br t10, ...` 把 `brcond`（`t10`）的输出 chain 作为输入，保证条件跳转排在无条件跳转之前。
+
+注意，基本块操作数 `BasicBlock:ch<exit>` 的类型也打印成 `ch`，也就是 `MVT::Other`，但它只是一个跳转目标，不是 chain。
+
+**XAI 写了什么。** 只有 `XAIISelLowering.cpp` 里的两行设置和两个函数：
+
+```cpp
+setOperationAction(ISD::BRCOND, MVT::Other, Expand);
+setOperationAction(ISD::BR_CC, MVT::i64, Custom);
+```
+
+`setOperationAction(节点, 类型, 动作)` 告诉 LLVM：这种节点在这个类型上，XAI 能不能直接选择。默认动作是 Legal，表示指令选择能直接匹配。Expand 表示交给 LLVM，把它改写成别的通用节点。Custom 表示由目标自己的 `LowerOperation` 处理。XAI 的 `LowerOperation` 只处理 `ISD::BR_CC`，交给 `LowerBR_CC`：
+
+```cpp
+switch (CC) {
+case ISD::SETEQ:  Opc = XAI::XAI_BEQ;  break;
+case ISD::SETNE:  Opc = XAI::XAI_BNE;  break;
+case ISD::SETULT: Opc = XAI::XAI_BLTU; break;
+case ISD::SETUGE: Opc = XAI::XAI_BGEU; break;
+default: report_fatal_error("XAI does not support this branch condition");
+}
+return SDValue(DAG.getMachineNode(Opc, SDLoc(Op), MVT::Other,
+                                  {LHS, RHS, Dest, Chain}), 0);
+```
+
+它直接返回机器节点，而不是先生成一个 `XAIISD` 节点、再写 `Pat` 去匹配。基本块的类型也是 `MVT::Other`，指令发射器只把最后一个 `Other` 操作数当作 chain，所以操作数顺序是比较的两端、目标块，最后才是 chain。
+
+**`loop.ll` 的 header 在每一步的 DAG。** 下面是 `llc -mtriple=xai -debug-only=isel` 打出的真实结果，`t2` 是下标 `%i`，`t4` 是上界 `%n`。这个选项需要带断言的 LLVM 构建。
+
+1. **构建 DAG。** `visitCondBr` 发现 `icmp` 和 `br` 在同一块，且比较结果只被这条跳转使用，就把比较折进分支，生成 `setcc`，再交给 `visitSwitchCase` 生成跳转。条件为真的目标 body 正好是下一块，`visitSwitchCase` 把真假目标对调，并用 `xor cond, -1` 把条件取反。另一个目标总会再接一条 `br`，即使它就是下一块：源码注释说明，这样做是为了方便后面需要取反条件的 DAG 优化。
+
+   ```
+   t6: i1 = setcc t2, t4, setult:ch
+   t8: i1 = xor t6, Constant:i1<-1>                       // 取反：i >= n
+   t10: ch = brcond t0, t8, BasicBlock:ch<exit>           // 成立就跳 exit
+   t12: ch = br t10, BasicBlock:ch<body>                  // 否则跳 body
+   ```
+
+2. **DAGCombiner 合并。** 这一步在合法化之前。`visitBRCOND` 先把 `xor (setcc ult), -1` 重写成 `setcc uge`，再把 `brcond (setcc ...)` 合成一个 `br_cc`。合成的前提是 `TLI.isOperationLegalOrCustom(ISD::BR_CC, i64)` 为真，XAI 把 `BR_CC` 设成 Custom，正好满足。也就是说，`BR_CC` 的 Custom 在这里第一次起作用。
+
+   ```
+   t16: ch = br_cc t0, setuge:ch, t2, t4, BasicBlock:ch<exit>
+   t12: ch = br t16, BasicBlock:ch<body>
+   ```
+
+3. **合法化。** `LegalizeDAG` 对每个节点查动作。`br_cc` 先查条件码 `setuge` 在 `i64` 上是否合法（默认合法），再查 `BR_CC` 在 `i64` 上的动作，得到 Custom，于是调用 `XAITargetLowering::LowerOperation`，最终进入 `LowerBR_CC`。`-debug-only=legalizedag` 的日志是：
+
+   ```
+   Legalizing: t16: ch = br_cc t0, setuge:ch, t2, t4, BasicBlock:ch<exit>
+   Trying custom legalization
+   Successfully custom legalized node
+    ... replacing: t16: ch = br_cc t0, setuge:ch, t2, t4, BasicBlock:ch<exit>
+        with:      t17: ch = XAI_BGEU t2, t4, BasicBlock:ch<exit>, t0
+   ```
+
+4. **指令选择。** `XAI_BGEU` 已经是机器节点，`Select` 不再处理。剩下的 `br` 由 `XAI_BR` 的模式 `[(br bb:$dst)]` 选中。
+
+   ```
+   t17: ch = XAI_BGEU t2, t4, BasicBlock:ch<exit>, t0
+   t12: ch = XAI_BR BasicBlock:ch<body>, t17
+   ```
+
+`-O0` 走的是同一条路径：DAGCombiner 在 `-O0` 下也会做这次合并。
+
+**`BRCOND` 的 Expand 是兜底。** 上面的路径里，`brcond` 在合法化之前就被合并掉了，没有走到 Expand。只有当某个 `brcond` 的条件不是 `setcc`、DAGCombiner 又没法改写时，它才会留到合法化。合法化查到 `BRCOND` 的动作是 Expand，就调用 LLVM 自带的 `SelectionDAGLegalize::ExpandNode`，XAI 不写代码：
+
+```cpp
+case ISD::BRCOND:
+  Tmp1 = Node->getOperand(0);                    // chain
+  Tmp2 = Node->getOperand(1);                    // cond
+  if (Tmp2.getOpcode() == ISD::SETCC &&
+      TLI.isOperationLegalOrCustom(ISD::BR_CC, Tmp2.getOperand(0).getValueType())) {
+    // brcond chain, (setcc lhs, rhs, cc), dest  =>  br_cc chain, cc, lhs, rhs, dest
+    Tmp1 = DAG.getNode(ISD::BR_CC, dl, MVT::Other, Tmp1, Tmp2.getOperand(2),
+                       Tmp2.getOperand(0), Tmp2.getOperand(1), Node->getOperand(2));
+  } else {
+    // brcond chain, cond, dest  =>  br_cc chain, setne, (and cond, 1), 0, dest
+    Tmp3 = DAG.getNode(ISD::AND, dl, Tmp2.getValueType(), Tmp2,
+                       DAG.getConstant(1, dl, Tmp2.getValueType()));
+    Tmp1 = DAG.getNode(ISD::BR_CC, dl, MVT::Other, Tmp1,
+                       DAG.getCondCode(ISD::SETNE), Tmp3,
+                       DAG.getConstant(0, dl, Tmp3.getValueType()), Node->getOperand(2));
+  }
+```
+
+源码在 `LegalizeDAG.cpp` 的 `case ISD::BRCOND`，上面省略了条件已经是 `undef` 或 `and x, 1` 时不再加 `and` 的分支。展开之后的处理分三步：
+
+1. `brcond` 被替换成新生成的 `br_cc`。条件是 `setcc` 时，直接取出它的两端和条件码；否则只看布尔值的最低位，变成“`cond & 1 != 0` 就跳”。
+2. 合法化会反复扫描整张图，直到没有未处理的节点。新的 `br_cc` 在下一轮被扫到，查到 `BR_CC` 在 `i64` 上是 Custom，于是和主路径一样进入 `LowerBR_CC`，变成 `XAI_BEQ` / `XAI_BNE` / `XAI_BLTU` / `XAI_BGEU`。
+3. 第二种情况生成的 `and` 也要被合法化和选择。XAI 没有 `and` 的选择模式，所以这条路径目前会在指令选择时报 `Cannot select`。
+
+如果 `BRCOND` 保留默认的 Legal，合法化不会改它，它会一直留到指令选择，而 XAI 没有匹配 `brcond` 的模式，同样会报 `Cannot select`。现有测试的条件都来自 `icmp`，DAGCombiner 总能先把它们合成 `br_cc`，不会走到这条兜底路径。
+
+`LowerBR_CC` 只认四种条件码：
 
 | 条件码 | 指令 |
 |---|---|
@@ -256,7 +398,56 @@ flowchart TD
 | `SETULT` | `xai.bltu` |
 | `SETUGE` | `xai.bgeu` |
 
-其他条件码在 `LowerBR_CC` 里报错。后面的形态不是指令选择生成的。PEI 之后、分配后调度之前，BranchFolder 调用 `analyzeBranch`，删掉紧接着跳到下一块的 `xai.br`。分配后调度之后的块排布可能把落在下一块上的分支取反。所以 `icmp ult` 在 `loop.ll` 里变成入口的 `xai.bgeu` 和循环体末尾的 `xai.bltu`。
+有符号比较、`SETUGT`、`SETULE` 等其他条件码直接报错，本目标没有用交换操作数的方法把它们换成这四种。条件如果不是来自 `icmp`，例如 `trunc i64 to i1`，类型合法化会生成 `and`，而 XAI 没有 `and` 的选择模式，也会报 `Cannot select`。
+
+指令选择结束时，`loop.ll` 的循环是：
+
+```
+bb.1.header:
+  XAI_BGEU %0:gpr, %11:gpr, %bb.3      // i >= n 跳到 exit
+  XAI_BR %bb.2                         // 否则跳到 body
+bb.2.body:
+  ...
+  XAI_BR %bb.1                         // 回到 header
+```
+
+每轮要执行三条跳转。后面两步由 LLVM 的通用 pass 完成，把它减到一条。
+
+#### 分支分析钩子
+
+`BranchFolder` 和 `MachineBlockPlacement` 不认识 XAI 的跳转指令。它们通过 `XAIInstrInfo` 的四个钩子读懂和改写基本块结尾：
+
+| 钩子 | 作用 |
+|---|---|
+| `analyzeBranch` | 从块尾往前识别最多两条跳转，给出条件跳转的目标 `TBB`、另一个目标 `FBB` 和条件 `Cond`。`Cond` 编码为 `[opcode, rs1, rs2]`。遇到 `xai.ret` 这类不认识的结尾返回 true，通用 pass 就不改这个块。`AllowModify` 为真时，顺手删除跳到下一块的 `xai.br` |
+| `removeBranch` | 删除块尾的所有跳转，按每条 4 字节报告删掉的长度 |
+| `insertBranch` | 按 `Cond` 重新生成条件跳转；有 `FBB` 时再加一条 `xai.br` |
+| `reverseBranchCondition` | 取反条件：`beq` ↔ `bne`，`bltu` ↔ `bgeu` |
+
+不实现这些钩子时，`analyzeBranch` 的默认实现返回“看不懂”，两个 pass 都不会动 XAI 的跳转。
+
+#### 删除跳到下一块的跳转
+
+PEI 之后、分配后调度之前，`BranchFolder` 对每个块调用 `analyzeBranch`。header 的 `FBB` 是 body，而 body 在布局上紧接着 header，所以只保留 `XAI_BGEU`，删掉 `XAI_BR %bb.2`。
+
+#### 循环回边
+
+分配后调度之后，`MachineBlockPlacement` 重新排布基本块。header 只剩一条比较跳转，复制它的代价很小，所以这个 pass 在 `-O2` 下做尾复制：把 header 复制进它的两个前驱，然后删掉 header。
+
+```
+bb.0.entry:
+  ...
+  XAI_BGEU $r5, $r3, %bb.3             // 复制进入口：第一次进入前判断
+bb.2.body:
+  ...
+  XAI_BLTU $r5, $r3, %bb.2             // 复制进循环尾：条件取反后跳回 body
+bb.3.exit:
+  XAI_RET
+```
+
+复制进 body 尾部时，原来的语义是 `i >= n` 跳到 exit，否则回 body。exit 被排在 body 后面，于是 pass 调用 `reverseBranchCondition`，把 `BGEU` 改成 `BLTU`：`i < n` 跳回 body，否则顺序落到 exit。原来回 header 的 `XAI_BR %bb.1` 也不再需要。最后每轮只执行回边上的一条 `xai.bltu`。
+
+`-O0` 不跑这两个 pass。汇编里保留 header，每个跳到下一块的地方都有一条 `xai.br`，每轮执行三条跳转。
 
 ### 3.4 指令调度
 
@@ -303,7 +494,7 @@ XAI 不写调度算法。分配前的 pass 是 `MachineScheduler`，分配后的
 | `eliminateFrameIndex` | 见下文 |
 | `emitPrologue` / `emitEpilogue` | 栈大小非 0 时用 `xai.addi` 调整 `r31` |
 
-帧向下增长，栈对齐 1024 字节，局部区域偏移为 0，没有 frame pointer，也不能在运行时重新对齐（`StackRealignable=false`）。函数代码的对齐是另一件事：`XAITargetLowering` 用 `setMinFunctionAlignment` 把它设为 4 字节。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
+帧向下增长，栈对齐 1024 字节，局部区域偏移为 0，没有 frame pointer，也不能在运行时重新对齐（`StackRealignable=false`）。函数代码的对齐是另一件事：`XAITargetLowering` 用 `setMinFunctionAlignment` 把它设为 4 字节。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。四个分支钩子由 `BranchFolder` 和 `MachineBlockPlacement` 调用，见 3.3，不属于分配器。
 
 栈帧大小由 PEI 的 `calculateFrameObjectOffsets` 计算，`emitPrologue` 和 `emitEpilogue` 只读取结果。它以进入函数时的 SP 为原点，按每个栈对象自己的大小和对齐往后排；对齐取整多出来的字节就是空隙，最后再按 1024 字节向上取整，得到 `StackSize`。这两个函数在 `StackSize` 为 0 时不插指令，否则分别插入 `xai.addi r31, r31, -StackSize` 和返回前的相反调整。入口 SP 按 1024 对齐是 ABI 假设，所以对象离原点的距离按它对齐，就等于地址按它对齐，不需要 frame pointer。
 
@@ -392,7 +583,7 @@ LBB0_3:
 	xai.ret
 ```
 
-`r5` 是下标，初值由 `xai.li` 写成 0；`r3` 是上界 `n`，`r4` 是步长。`xai.add` 把步长加进下标，`xai.addi` 做指针步进。入口的 `xai.bgeu` 在下标已经不小于上界时直接跳到 `xai.ret`。循环体末尾的 `xai.bltu` 只在更新后的下标仍小于上界时回到 `LBB0_2`；条件不成立时不跳转，顺序落到紧接着的 `xai.ret`。跳到紧邻下一块的 `xai.br` 已被删掉。
+`r5` 是下标，初值由 `xai.li` 写成 0；`r3` 是上界 `n`，`r4` 是步长。`xai.add` 把步长加进下标，`xai.addi` 做指针步进。入口的 `xai.bgeu` 在下标已经不小于上界时直接跳到 `xai.ret`。循环体末尾的 `xai.bltu` 只在更新后的下标仍小于上界时回到 `LBB0_2`；条件不成立时不跳转，顺序落到紧接着的 `xai.ret`。原来的 header 块已被复制进入口和循环尾，跳到紧邻下一块的 `xai.br` 已被删掉，每轮只执行一条跳转。各个 pass 怎么改出这个形态，见 3.3。
 
 ### 4.3 矩阵寄存器 spill
 
@@ -468,7 +659,13 @@ bb.3.exit:
   XAI_RET
 ```
 
-`calculateFrameObjectOffsets` 把两个槽依次排在入口 SP 下方：`fi#0` 在 -1024，`fi#1` 在 -2048。两者都已经 1024 字节对齐，中间没有空隙，`StackSize` 为 2048。`emitPrologue` 在函数开头插入 `-2048`，`emitEpilogue` 在 `XAI_RET` 前插入 `+2048`。`eliminateFrameIndex` 把 `%stack.N, 0` 改成 `$r31, objectOffset + StackSize + 0`：`fi#0` 是 -1024 + 2048 = 1024，`fi#1` 是 -2048 + 2048 = 0。
+分配结束后，PEI 做三件事：
+
+1. `calculateFrameObjectOffsets` 给槽算位置（offset）。它从入口 SP 往下依次排列两个槽：`fi#0` 放在 `[SP-1024]`，`fi#1` 放在 `[SP-2048]`。两个槽都是 1024 字节、按 1024 字节对齐，中间没有空隙，所以 `StackSize = 2048`。
+2. `emitPrologue` / `emitEpilogue` 调整栈指针。在函数开头插入 `xai.addi r31, r31, -2048`，在 `XAI_RET` 之前插入 `xai.addi r31, r31, 2048`。
+3. `eliminateFrameIndex` 把栈槽编号换成相对 `r31` 的地址，偏移等于 `objectOffset + StackSize + 原立即数`：
+   - `%stack.0, 0` 变成 `$r31, -1024 + 2048 + 0`，也就是 `1024(r31)`。
+   - `%stack.1, 0` 变成 `$r31, -2048 + 2048 + 0`，也就是 `0(r31)`。
 
 **5. 展开剩下的拷贝（`-print-after=postrapseudos`）。** `$m1 = COPY killed $m7` 的两端是不同的物理寄存器，`ExpandPostRAPseudos` 调用 `copyPhysReg`，生成 `$m1 = XAI_MMOV killed $m7`。
 
@@ -526,13 +723,13 @@ FileCheck 不检查寄存器号、spill 个数和偏移，只检查四点：入�
 | `llvm/lib/Target/XAI/XAI.td` | 目标、汇编打印、`generic` 处理器 |
 | `XAIRegisterInfo.td` | GPR、MR、编码与 DWARF 号 |
 | `XAICallingConv.td` | `CC_XAI` |
-| `XAIInstrInfo.td` | 指令、`Pat`、分支操作数 `brtarget` |
+| `XAIInstrInfo.td` | 指令、`Pat`（含地址步进用的 `XAI_ADD` / `XAI_ADDI`）、立即数谓词 `XAISimm32`、分支操作数 `brtarget` |
 | `XAISchedule.td` | `XAIModel`：发射宽度、延迟、`InstRW` |
 | `XAITargetMachine.cpp` | data layout、pass config、`XAITargetMachine` 注册 |
 | `XAISubtarget.h` | 指令、栈帧、lowering 和 `XAIModel` 的集合；`enableMachineScheduler` 打开分配前调度 |
 | `XAIISelLowering.cpp` | 合法类型、参数、返回、`BR_CC` |
 | `XAIISelDAGToDAG.cpp` | 选择逻辑 `XAIDAGToDAGISel`，以及 pass 包装 `XAIDAGToDAGISelLegacy` |
-| `XAIInstrInfo.cpp` | 拷贝、spill、reload、分支折叠 |
+| `XAIInstrInfo.cpp` | 拷贝、spill、reload，以及供分支折叠和块排布使用的四个分支钩子 |
 | `XAIRegisterInfo.cpp` | 保留寄存器、帧索引消除 |
 | `XAIFrameLowering.cpp` | `r31` 的 prologue / epilogue |
 | `XAIAsmPrinter.cpp` | 跳过 meta 指令，把 `MachineInstr` 降成 `MCInst` 并送入流 |
