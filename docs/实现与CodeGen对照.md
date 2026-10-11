@@ -8,7 +8,7 @@ XAI 是教学用目标，架构名 `xai`。LLVM 的 OS 类型里已经占用了 
 
 ## 1. 流水线
 
-AI 后端和 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、MachineScheduler、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、调度模型、分配与栈帧钩子、MC 打印。`Sched::RegPressure` 只影响 SelectionDAG 的发射顺序。MachineInstr 的调度在指令选择之后：分配前一次，帧处理之后再一次，用的是 `XAISchedule.td` 里的顺序发射模型。PEI 仍是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。
+XAI 与通用 CPU 后端共用 LLVM CodeGen。LLVM 提供合法化驱动、SelectionDAG 选择框架、BranchFolder、寄存器分配、MachineScheduler、PEI 和汇编流。目标提供这些框架要调用的描述和钩子：寄存器类、合法类型、调用约定、DAG lowering、指令模式、调度模型、分配与栈帧钩子、MC 打印。`Sched::RegPressure` 只影响 SelectionDAG 在指令选择期间的发射顺序，不影响后面的 MachineScheduler。MachineInstr 的调度有两次，用的都是 `XAISchedule.td` 里的顺序发射模型：一次在寄存器分配前，一次在 PEI、分支折叠和伪指令展开之后。PEI 是 LLVM 的 pass，插入的 prologue 和 epilogue 指令来自 `XAIFrameLowering`。下图只画主要阶段，寄存器合并、分支折叠、伪指令展开和块排布没有单独列出。
 
 ```mermaid
 flowchart TD
@@ -27,11 +27,13 @@ flowchart TD
   ir --> legal --> isel --> miv --> presched --> ra --> pei --> postsched --> mi --> asm --> text
 ```
 
-`XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 挂上 `XAIDAGToDAGISel`，其余 pass 使用 TargetPassConfig 的默认序列。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small，函数对齐是 4 字节。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
+`mi` 不是一个 pass。寄存器分配把虚拟寄存器换成物理寄存器，PEI 和分配后调度都改的是这些指令；`mi` 表示 AsmPrinter 读到的那份结果。
+
+`XAITargetMachine` 继承 `CodeGenTargetMachineImpl`。`XAIPassConfig::addInstSelector` 加入 `XAIDAGToDAGISelLegacy`，它包装真正做选择的 `XAIDAGToDAGISel`，原因见 3.3；其余 pass 使用 TargetPassConfig 的默认序列。默认 CPU 是 `generic`，重定位模型是 static，代码模型是 Small。`XAITargetLowering` 把函数对齐设为 4 字节。`TargetLoweringObjectFileELF` 只为创建汇编流而存在。
 
 | 阶段 | LLVM 负责 | 本仓库中的实现 |
 |---|---|---|
-| 目标注册 | `TargetRegistry`，按 triple 选择 `TargetMachine` | `TargetInfo/XAITargetInfo.cpp`，`RegisterTarget<Triple::xai>` |
+| 目标注册 | `TargetRegistry`，按 triple 选择 `TargetMachine` | 四个 `LLVMInitializeXAI*` 函数，见 1.1 |
 | 类型合法化 | 按合法类型拆分或提升非法类型 | `XAIISelLowering.cpp` 登记 `i64`、`v256f16`、`v256f32` |
 | 调用约定 | `CCState` 按 TableGen 规则分配位置 | `XAICallingConv.td` 的 `CC_XAI`，C++ 拒绝栈参数和非 `void` 返回 |
 | 指令选择 | SelectionDAG 匹配 `Pat`，Custom 节点调用 `LowerOperation` | `XAIInstrInfo.td`；访存和 `BR_CC` 在 C++ 中完成 |
@@ -40,7 +42,7 @@ flowchart TD
 | 分支折叠 | BranchFolder 调用 `analyzeBranch` 等钩子 | `XAIInstrInfo.cpp` |
 | 寄存器分配 | 分配虚拟寄存器，必要时插入 spill | `copyPhysReg`，以及 `xai.st` / `xai.ld`、`xai.mstore.f32` / `xai.mload.f32` |
 | 栈帧 | PEI 调用 prologue、epilogue 和帧索引消除 | `XAIFrameLowering.cpp`、`XAIRegisterInfo::eliminateFrameIndex` |
-| 汇编打印 | AsmPrinter 把 `MachineInstr` 送到 MC 流 | `XAIAsmPrinter.cpp`、`XAIInstPrinter.cpp` |
+| 汇编打印 | AsmPrinter 把 `MachineInstr` 降成 `MCInst`，送到 MC 流 | `XAIAsmPrinter.cpp`、`XAIMCInstLower.cpp`、`XAIInstPrinter.cpp` |
 
 Data layout：
 
@@ -63,11 +65,96 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 
 `lib/Target/CMakeLists.txt` 按 `LLVM_TARGETS_TO_BUILD` 添加子目录，因此目标目录本身不必再手写 `add_subdirectory`。
 
+### 1.1 目标注册与组件关系
+
+`llc` 启动时依次调用 `InitializeAllTargets()`、`InitializeAllTargetMCs()`、`InitializeAllAsmPrinters()`。其中 `InitializeAllTargets()` 先调用各目标的 `TargetInfo` 初始化函数，再调用 `Target` 初始化函数。对 XAI，这三步一共调用四个函数：
+
+| 函数 | 文件 | 登记到 | 登记内容 | 何时取用 |
+|---|---|---|---|---|
+| `LLVMInitializeXAITargetInfo` | `TargetInfo/XAITargetInfo.cpp` | `TargetRegistry` | `Target` 对象，名字 `xai`，匹配 `Triple::xai` | `-mtriple=xai` 查找目标 |
+| `LLVMInitializeXAITarget` | `XAITargetMachine.cpp` | `TargetRegistry`、`PassRegistry` | `XAITargetMachine` 的工厂；`xai-isel`、`xai-asm-printer` 两个 pass 名 | 创建 `TargetMachine`；`-print-after`、`-stop-after` 等按名字查找 pass |
+| `LLVMInitializeXAITargetMC` | `MCTargetDesc/XAIMCTargetDesc.cpp` | `TargetRegistry` | `MCAsmInfo`、`MCInstrInfo`、`MCRegisterInfo`、`MCSubtargetInfo`、`MCInstPrinter`、`MCAsmBackend` 六个工厂 | 前四个由 `XAITargetMachine` 构造时的 `initAsmInfo` 取用；后两个在创建汇编流时取用 |
+| `LLVMInitializeXAIAsmPrinter` | `XAIAsmPrinter.cpp` | `TargetRegistry` | `XAIAsmPrinter` 的工厂 | `addPassesToEmitFile` 创建 `AsmPrinter` pass |
+
+两张注册表作用不同。`TargetRegistry` 按目标保存工厂函数，用来创建 `TargetMachine`、MC 组件和 `AsmPrinter`。`PassRegistry` 保存 pass 的 ID、命令行名和构造方式，用来按名字查找 pass。`initializeXAIAsmPrinterPass` 和 `initializeXAIDAGToDAGISelLegacyPass` 由各自 `.cpp` 中的 `INITIALIZE_PASS` 宏生成，只登记名字，不决定 pass 在流水线中的位置。
+
+```mermaid
+flowchart TD
+  subgraph init["llc 启动：注册"]
+    fInfo["LLVMInitializeXAITargetInfo"]
+    fTarget["LLVMInitializeXAITarget"]
+    fMC["LLVMInitializeXAITargetMC"]
+    fAsm["LLVMInitializeXAIAsmPrinter"]
+  end
+
+  subgraph registry["注册表"]
+    treg["TargetRegistry：目标 xai"]
+    preg["PassRegistry：xai-isel、xai-asm-printer"]
+  end
+
+  fInfo -- "RegisterTarget" --> treg
+  fTarget -- "RegisterTargetMachine" --> treg
+  fTarget -- "initializeXAI*Pass" --> preg
+  fMC -- "六个 MC 组件工厂" --> treg
+  fAsm -- "RegisterAsmPrinter" --> treg
+
+  subgraph build["编译：按 -mtriple=xai 创建"]
+    tm["XAITargetMachine"]
+    st["XAISubtarget"]
+    mcinfo["MCAsmInfo / MCInstrInfo<br/>MCRegisterInfo / MCSubtargetInfo"]
+    pc["XAIPassConfig"]
+    isel["XAIDAGToDAGISelLegacy<br/>包装 XAIDAGToDAGISel"]
+    mid["调度、寄存器分配、PEI<br/>等框架 pass"]
+    ap["XAIAsmPrinter"]
+    free["Free MachineFunction"]
+  end
+
+  treg --> tm
+  tm -- "成员持有" --> st
+  tm -- "initAsmInfo" --> mcinfo
+  tm -- "createPassConfig" --> pc
+  pc -- "addInstSelector" --> isel
+  isel --> mid --> ap --> free
+
+  subgraph mc["AsmPrinter 内部：MC 层"]
+    mi["MachineInstr，物理寄存器"]
+    mcinst["MCInst"]
+    stream["MCStreamer，文本汇编"]
+    ab["XAIAsmBackend"]
+    text["文本汇编"]
+    obj["二进制机器码"]
+  end
+
+  ap --> mi
+  mi -- "lowerXAIMachineInstrToMCInst" --> mcinst
+  mcinst -- "EmitToStreamer" --> stream
+  stream -- "XAIInstPrinter 打印" --> text
+  ab -. "创建流时提供" .-> stream
+  mcinst -. "MCCodeEmitter，本目标未实现" .-> obj
+```
+
+注册顺序不决定 pass 的先后。一次编译怎么把这些组件串起来，见 1.2。
+
+### 1.2 一次编译的顺序
+
+`llc -mtriple=xai` 按下面的顺序进行。
+
+1. 启动时调用 1.1 的四个函数，把工厂和 pass 名写入注册表。这一步只做一次。
+2. 按 triple 创建 `XAITargetMachine`。构造函数同时创建成员 `XAISubtarget`，里面有 `XAIInstrInfo`、`XAIFrameLowering`、`XAITargetLowering`，并按 CPU 名 `generic` 找到 `XAIModel`。接着 `initAsmInfo` 从 `TargetRegistry` 取出 `MCRegisterInfo`、`MCInstrInfo`、`MCSubtargetInfo` 和 `MCAsmInfo`。
+3. `CodeGenTargetMachineImpl::addPassesToEmitFile` 搭建流水线，分三步，与上面的注册顺序无关：
+   - `addPassesToGenerateCode` 调用 `createPassConfig`，得到 `XAIPassConfig`。它的构造函数用 `substitutePass` 把分配后调度从 `PostRAScheduler` 换成 `PostMachineScheduler`。框架按默认序列加 pass；加到指令选择时回调 `addInstSelector`，加入 `createXAIISelDag` 返回的 `XAIDAGToDAGISelLegacy`。
+   - `addAsmPrinter` 从 `TargetRegistry` 取出 `XAIAsmPrinter` 的工厂，创建 pass 并加在代码生成 pass 之后。所以它是最后一个生成代码的 pass。
+   - 最后加入 `Free MachineFunction`，释放每个函数的 `MachineFunction`。`llc -debug-pass=Structure` 的末尾就是 `XAI Assembly Printer`、`Free MachineFunction`。
+4. 对每个函数跑这条流水线。轮到指令选择时，pass 管理器调用 `XAIDAGToDAGISelLegacy`，它把每个 DAG 节点交给内部的 `XAIDAGToDAGISel::Select`。之后的 pass 通过 `MF.getSubtarget()` 取得同一个 `XAISubtarget`，再取出寄存器、指令、栈帧和调度模型。
+5. `XAIAsmPrinter` 把每条 `MachineInstr` 降成 `MCInst` 并打印成文本汇编，见 3.6。
+
+`-O0` 不加入两次 MachineInstr 调度，以及分支折叠等后期优化。`-stop-after` 截断流水线时，`addPassesToEmitFile` 改为加入 MIR 打印 pass，不再创建 `AsmPrinter`。
+
 ## 2. 寄存器、指令与调用约定
 
 ### 2.1 寄存器
 
-| 类 | 寄存器 | 机器类型 | 分配宽度 |
+| 类 | 寄存器 | 机器类型 | 溢出槽 |
 |---|---|---|---|
 | `GPR` | `r0`–`r31` | `i64` | 8 字节，对齐 8 字节 |
 | `MR` | `m0`–`m7` | `v256f32`、`v256f16` | 1024 字节，对齐 1024 字节 |
@@ -131,7 +218,7 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 
 ### 3.2 参数与返回值
 
-`LowerFormalArguments` 用 `CC_XAI` 分析参数。寄存器参数通过 `addLiveIn` 进入 `GPR`，再 `getCopyFromReg` 交给 DAG。三个指针参数因此成为 `r0`、`r1`、`r2` 的 live-in。
+`LowerFormalArguments` 用 `CC_XAI` 分析参数。寄存器参数通过 `addLiveIn` 进入 `GPR`，再 `getCopyFromReg` 交给 DAG。例如三个指针参数成为 `r0`、`r1`、`r2` 的 live-in。
 
 `LowerReturn` 在返回值为空时生成 `XAIISD::RET_FLAG`。该节点带 chain，由 `XAI_RET` 的 pattern 选成 `xai.ret`。
 
@@ -139,7 +226,9 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 
 `llvm.xai.*` 在合法化阶段保持为通用 intrinsic 节点，不生成 `XAIISD` 节点，也不生成 `MachineInstr`。构建 DAG 时，`IntrNoMem` 的 `llvm.xai.mma` 成为 `ISD::INTRINSIC_WO_CHAIN`，读内存的 `mload` 成为 `ISD::INTRINSIC_W_CHAIN`，写内存的 `mstore` 成为 `ISD::INTRINSIC_VOID`。节点上带的是 intrinsic ID。`v256f16` 和 `v256f32` 已登记为合法类型，合法化不拆开这些节点。`LowerOperation` 只处理 `ISD::BR_CC`。本目标唯一的 target-specific DAG 节点是 `LowerReturn` 生成的 `XAIISD::RET_FLAG`。
 
-选择器是 `XAIDAGToDAGISel`。`Select` 先处理 tile 访存 intrinsic，其余节点交给 TableGen 生成的 `SelectCode`。`llvm.xai.mma` 由 `XAIInstrInfo.td` 的 `Pat` 选成 `XAI_MMA`。四条访存 intrinsic 带 chain，TableGen 的 `Pat` 匹配不上，由 `selectMemIntrinsic` 在 C++ 里选成对应的 `MachineInstr`。
+选择逻辑和 pass 包装是两个类。`XAIDAGToDAGISel` 继承 `SelectionDAGISel`，只负责选择，不实现 pass 接口。`XAIDAGToDAGISelLegacy` 继承 `SelectionDAGISelLegacy`，是旧 pass 管理器里的 `FunctionPass`：它持有一个 `XAIDAGToDAGISel`，被调用时把工作转过去。LLVM 这样拆，是为了让同一套选择逻辑适配新旧两种 pass 管理器；新 pass 管理器对应的包装是 `SelectionDAGISelPass`。XAI 只写了旧包装，`llc` 默认走这条路径。`createXAIISelDag` 返回的是 `XAIDAGToDAGISelLegacy`。`INITIALIZE_PASS` 登记的名字 `xai-isel` 也属于这个包装类，见 1.1。
+
+`Select` 先处理 tile 访存 intrinsic，其余节点交给 TableGen 生成的 `SelectCode`。`llvm.xai.mma` 由 `XAIInstrInfo.td` 的 `Pat` 选成 `XAI_MMA`。四条访存 intrinsic 带 chain，TableGen 的 `Pat` 匹配不上，由 `selectMemIntrinsic` 在 C++ 里选成对应的 `MachineInstr`。
 
 | DAG | 选择结果 | 实现位置 |
 |---|---|---|
@@ -169,9 +258,28 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 | `SETULT` | `xai.bltu` |
 | `SETUGE` | `xai.bgeu` |
 
-块布局会把落在下一块上的真分支取反，所以 `icmp ult` 经常变成跳出循环的 `xai.bgeu`。`analyzeBranch` 删掉紧接着跳到下一块的 `xai.br`。分支折叠随后把循环头和回边合成条件跳转：入口用 `xai.bgeu` 判断是否跳过循环，循环体末尾用 `xai.bltu` 回到自身。其他条件码在 `LowerBR_CC` 里报错。
+其他条件码在 `LowerBR_CC` 里报错。后面的形态不是指令选择生成的。PEI 之后、分配后调度之前，BranchFolder 调用 `analyzeBranch`，删掉紧接着跳到下一块的 `xai.br`。分配后调度之后的块排布可能把落在下一块上的分支取反。所以 `icmp ult` 在 `loop.ll` 里变成入口的 `xai.bgeu` 和循环体末尾的 `xai.bltu`。
 
-### 3.4 寄存器分配、spill 与栈帧
+### 3.4 指令调度
+
+两次调度都读 `XAIModel`，由框架完成依赖图和发射时间的计算。XAI 只提供这张表，并打开两个开关：`enableMachineScheduler` 返回 true；`XAIPassConfig` 用 `substitutePass` 把旧的 `PostRAScheduler` 换成 `PostMachineScheduler`。`-O0` 两者都不跑。
+
+| | 分配前 `MachineScheduler` | 分配后 `PostMachineScheduler` |
+|---|---|---|
+| 位置 | 寄存器合并之后、分配之前 | PEI、分支折叠和 `ExpandPostRAPseudos` 之后，块排布之前 |
+| 看到的寄存器 | 虚拟寄存器 | 已经分配好的物理寄存器 |
+| 目标 | 兼顾延迟和寄存器压力。排得太散会让更多值同时存活，增加 spill | 只缩短停顿。寄存器已经定死，不再考虑 spill |
+| 额外约束 | 数据依赖和内存依赖 | 同一个物理寄存器被重复使用时，写不能越过尚未读完的旧值 |
+
+`XAIModel` 是顺序、单发射模型（`IssueWidth = 1`，`MicroOpBufferSize = 0`）。`CompleteModel = 1`，所以每条指令，包括 `COPY`，都要有 `InstRW`。延迟是相对代价，不是实测周期：GPR 运算、移动、立即数、GPR 访存和分支是 1，矩阵 load 和 `xai.mma` 是 4，矩阵 store 是 2。
+
+框架建依赖图时，寄存器数据依赖边的延迟等于**生产者**的延迟，也就是结果写完后要过多久才能被读。`xai.mload.f32` 到 `xai.mma` 的边是 4，因为 load 写出矩阵寄存器。`xai.mstore` 不写寄存器，它的 2 不会变成这种边；和其他指令之间只有内存顺序约束，框架给 store 之后的 load 用固定延迟 1。XAI 没有 `ReadAdvance`，也没有自己的调度算法：最早发射周期和选下一条指令都由 `GenericScheduler` 计算。
+
+`sched.ll` 里把地址加法提到 `xai.mma` 前面的是分配后调度。分配前调度只把一个 `COPY` 挪到靠近它的使用者的地方，缩短虚拟寄存器的存活范围。加法与 `xai.mma` 没有数据依赖，而它写入的物理寄存器此时已经没有人再读，所以可以填进 load 的等待空隙。`-O0` 不调度，加法仍留在 store 之后。
+
+本目标不插入 `nop`，也不做冒险识别。调度只改变顺序；硬件被假定会在结果未就绪时自行停顿，所以 `-O0` 的结果仍然正确。
+
+### 3.5 寄存器分配、spill 与栈帧
 
 分配器是 LLVM 自带的。目标提供的是它调用的钩子。
 
@@ -183,32 +291,49 @@ e-m:e-p:64:64-i64:64-i32:32-i16:16-i8:8-f64:64-f32:32-f16:16-n64-S8192
 | `eliminateFrameIndex` | 见下文 |
 | `emitPrologue` / `emitEpilogue` | 栈大小非 0 时用 `xai.addi` 调整 `r31` |
 
-帧向下增长，对齐 1024 字节，局部区域偏移为 0，没有 frame pointer。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。栈大小为 0 时 `adjustSP` 不插入指令。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
+帧向下增长，栈对齐 1024 字节，局部区域偏移为 0，没有 frame pointer，也不能在运行时重新对齐（`StackRealignable=false`）。`setStackPointerRegisterToSaveRestore(r31)` 把 `r31` 交给 PEI。`analyzeBranch`、`insertBranch` 和 `removeBranch` 由 BranchFolder 调用，见 3.3，不属于分配器。
 
-spill 槽在分配期间是帧索引。`eliminateFrameIndex` 把该操作数改成 `r31`，并把下一条立即数设为：
+栈帧大小由 PEI 的 `calculateFrameObjectOffsets` 计算，`emitPrologue` 和 `emitEpilogue` 只读取结果。它以进入函数时的 SP 为原点，按每个栈对象自己的大小和对齐往后排；对齐取整多出来的字节就是空隙，最后再按 1024 字节向上取整，得到 `StackSize`。这两个函数在 `StackSize` 为 0 时不插指令，否则分别插入 `xai.addi r31, r31, -StackSize` 和返回前的相反调整。入口 SP 按 1024 对齐是 ABI 假设，所以对象离原点的距离按它对齐，就等于地址按它对齐，不需要 frame pointer。
+
+溢出槽的大小和对齐来自寄存器类，不是来自上面的栈对齐值。`GPR` 是 8 字节、8 对齐，`MR` 是 1024 字节、1024 对齐。两种槽排在一起时，各自按自己的对齐取整。因为栈不能重新对齐，对象要求的对齐超过 1024 时会被截到 1024；XAI 把栈对齐设成 1024，就是为了让矩阵槽不被截小。XAI 的栈帧目前只有溢出槽和这些对齐填充：没有 `alloca`，栈上传参会报错，也没有被调用者保存寄存器。
+
+spill 槽在分配期间是帧索引。`eliminateFrameIndex` 在 prologue 已经插入之后，把该操作数改成 `r31`，并把下一条立即数设为：
 
 ```
 objectOffset + stackSize + 原立即数 + SPAdj
 ```
 
-向下增长时，对象偏移为负，加上栈大小后成为相对最终 `r31` 的非负位移。prologue 在此之前已经执行 `xai.addi r31, r31, -stackSize`。epilogue 在第一个 terminator 之前执行相反的 `xai.addi`。
+向下增长时，对象偏移为负，加上栈大小后成为相对调整后的 `r31` 的非负位移。epilogue 插在第一个 terminator 之前。
 
-`mma.ll` 的矩阵值个数不超过 8，汇编里没有栈调整。`spill.ll` 把 9 个 MMA 结果放进循环 phi，使它们在回边上同时存活。单条指令最多读三个矩阵寄存器，活值个数仍然超过 `m0`–`m7`，因此至少有一个 MR 进入 1024 字节栈槽。对应汇编包含：
+`mma.ll` 的矩阵值个数不超过 8，汇编里没有栈调整。`spill.ll` 把 9 个 MMA 结果放进循环 phi，使它们在回边上同时存活。单条指令最多读三个矩阵寄存器，活值个数仍然超过 `m0`–`m7`，因此至少有一个 MR 进入 1024 字节栈槽。汇编形态见 4.3。FP16 tile 若被 spill，使用的仍是 FP32 宽度的 `xai.mstore.f32` / `xai.mload.f32`。`xai.li` 标了 `isReMaterializable` 和 `isAsCheapAsAMove`，有符号 32 位常量在寄存器不够时可以重新物化。
 
-- `xai.addi r31, r31, -N`，`N` 为 1024 的倍数
-- `xai.mstore.f32 imm(r31), m*`
-- `xai.mload.f32 m*, imm(r31)`
-- 返回前的 `xai.addi r31, r31, N`
+### 3.6 MC 与汇编打印
 
-FP16 tile 若被 spill，使用的仍是 FP32 宽度的 `xai.mstore.f32` / `xai.mload.f32`。`xai.li` 标了 `isReMaterializable` 和 `isAsCheapAsAMove`，有符号 32 位常量在寄存器不够时可以重新物化。
+`XAIAsmPrinter` 是最后一个生成代码的 pass，位置见 1.2。它把每条 `MachineInstr` 降成 `MCInst`，再交给 MC 层输出。`MCInst` 既不是汇编文本，也不是二进制机器码，而是这两种输出共同的输入。MC 组件从哪里注册，见 1.1。
 
-`generic` 使用 `XAIModel`：顺序发射，每周期一条指令。延迟是相对代价，不是实测周期。GPR 运算、移动、立即数、GPR 访存和分支是 1；矩阵 load 和 `xai.mma` 是 4；矩阵 store 是 2。结果在延迟结束前不能被读，所以一条与乘加无关的地址加法可以插进矩阵 load 和 `xai.mma` 之间。`sched.ll` 锁住这个顺序；`-O0` 不调度，加法仍留在 store 之后。
+| 表示 | 所在层 | 内容 |
+|---|---|---|
+| `MachineInstr` | CodeGen | 操作码、显式与隐式操作数、`killed` / `dead` 等寄存器标记、所属基本块、内存操作数 |
+| `MCInst` | MC | 操作码和显式操作数。操作数只有寄存器、立即数、表达式三类 |
+| 文本汇编 | 输出 | `XAIInstPrinter` 按 TableGen 的汇编字符串打印 `MCInst` |
+| 二进制机器码 | 输出 | `MCCodeEmitter` 把 `MCInst` 编码成字节；本目标未实现 |
 
-### 3.5 MC 与汇编打印
+`XAIAsmPrinter::emitInstruction` 跳过 `KILL`、`DBG_VALUE` 这类 meta 指令，调用 `lowerXAIMachineInstrToMCInst`，再 `EmitToStreamer`。`lowerXAIMachineInstrToMCInst` 是 `AsmPrinter` 内部调用的函数，不是单独的 pass。它按下面的规则转换：
 
-`XAIAsmPrinter::emitInstruction` 跳过 meta 指令，调用 `lowerXAIMachineInstrToMCInst`，再 `EmitToStreamer`。可降下的操作数是寄存器、立即数和基本块。基本块变成 `MCSymbolRefExpr`，指向该块的 `MCSymbol`。`XAIInstPrinter::printOperand` 打印寄存器名、十进制立即数，以及 `MCAsmInfo::printExpr` 产生的标号（形如 `LBB0_1`）。
+1. 操作码原样复制。`MachineInstr` 与 `MCInst` 共用 TableGen 生成的 `XAI::XAI_*` 枚举。
+2. 只转换显式操作数，即 `.td` 里 `outs` / `ins` 列出的操作数。隐式操作数不进汇编，直接丢弃。
+3. 寄存器只保留物理寄存器号，丢掉 `killed`、`dead`、`renamable` 等标记。立即数原样复制。基本块换成指向该块 `MCSymbol` 的 `MCSymbolRefExpr`；标号地址要等汇编器排好指令后才确定，所以写成表达式而不是数值。
+4. 其他操作数类型报错。帧索引在 PEI 中已由 `eliminateFrameIndex` 换成 `r31` 加偏移，不应出现在这里；全局地址等类型本目标不支持。
 
-汇编字符串来自 TableGen。`xai.mma $dst, $a, $b, $acc` 在物理寄存器确定后打印为 `xai.mma m0, m0, m1, m2` 这类形式。
+`-print-before=xai-asm-printer` 打印降级前的 `MachineInstr`，`-asm-show-inst` 在汇编旁注释出对应的 `MCInst`。`mma.ll` 和 `loop.ll` 中的两条指令如下：
+
+| 阶段 | `mma.ll` 中的乘加 | `loop.ll` 中的回边分支 |
+|---|---|---|
+| `MachineInstr` | `$m0 = XAI_MMA killed $m0, killed $m1, killed $m2` | `XAI_BLTU $r5, $r3, %bb.2` |
+| `MCInst` | `XAI_MMA`：`Reg:M0`、`Reg:M0`、`Reg:M1`、`Reg:M2` | `XAI_BLTU`：`Reg:R5`、`Reg:R3`、`Expr:LBB0_2` |
+| 文本汇编 | `xai.mma m0, m0, m1, m2` | `xai.bltu r5, r3, LBB0_2` |
+
+打印时，`XAIInstPrinter` 调用 TableGen 生成的 `printInstruction`，格式来自 `XAIInstrInfo.td` 的汇编字符串，例如 `xai.mma $dst, $a, $b, $acc`。`printOperand` 打印三类操作数：寄存器名由 `getRegisterName` 查 `XAIRegisterInfo.td` 得到，立即数打印成十进制，表达式由 `MCAsmInfo::printExpr` 打印成 `LBB0_2` 这样的标号。
 
 文本汇编的流在创建时需要 `MCAsmBackend`。`XAIAsmBackend` 是小端实现：`applyFixup` 不写修复，`writeNopData` 写 0。`createObjectTargetWriter` 返回一个 ELF writer，重定位类型在 `getRelocType` 里报错。没有注册 `MCCodeEmitter`，因此 `llc -filetype=obj` 在创建编码器时失败。
 
@@ -283,13 +408,14 @@ xai.ret
 | `XAICallingConv.td` | `CC_XAI` |
 | `XAIInstrInfo.td` | 指令、`Pat`、分支操作数 `brtarget` |
 | `XAISchedule.td` | `XAIModel`：发射宽度、延迟、`InstRW` |
-| `XAITargetMachine.cpp` | data layout、pass config、目标注册 |
+| `XAITargetMachine.cpp` | data layout、pass config、`XAITargetMachine` 注册 |
+| `XAISubtarget.h` | 指令、栈帧、lowering 和 `XAIModel` 的集合；`enableMachineScheduler` 打开分配前调度 |
 | `XAIISelLowering.cpp` | 合法类型、参数、返回、`BR_CC` |
-| `XAIISelDAGToDAG.cpp` | tile load/store 的自定义选择 |
+| `XAIISelDAGToDAG.cpp` | 选择逻辑 `XAIDAGToDAGISel`，以及 pass 包装 `XAIDAGToDAGISelLegacy` |
 | `XAIInstrInfo.cpp` | 拷贝、spill、reload、分支折叠 |
 | `XAIRegisterInfo.cpp` | 保留寄存器、帧索引消除 |
 | `XAIFrameLowering.cpp` | `r31` 的 prologue / epilogue |
-| `XAIAsmPrinter.cpp` | `MachineInstr` 到流 |
+| `XAIAsmPrinter.cpp` | 跳过 meta 指令，把 `MachineInstr` 降成 `MCInst` 并送入流 |
 | `XAIMCInstLower.cpp` | 寄存器、立即数、基本块到 `MCInst` |
 | `MCTargetDesc/XAIInstPrinter.cpp` | 汇编文本 |
 | `MCTargetDesc/XAIMCTargetDesc.cpp` | 注册 MC 组件；无 `MCCodeEmitter` |
@@ -321,4 +447,4 @@ TableGen 生成 `XAIGenDAGISel.inc`、`XAIGenInstrInfo.inc`、`XAIGenRegisterInf
 | 超出有符号 32 位的整数常量 | `xai.li` / `xai.addi` 的模式不匹配 |
 | `llc -filetype=obj` | 缺少 `MCCodeEmitter` |
 
-后端不包含这些组件：汇编解析器、反汇编器、指令行程、GlobalISel、Clang builtin、MLIR dialect，以及把汇编执行或与参考 GEMM 对数值的运行时。
+没有旧式指令行程（itinerary）。调度信息在 `XAISchedule.td` 的 `SchedMachineModel` 里，见 3.4。后端也不包含汇编解析器、反汇编器、GlobalISel、Clang builtin、MLIR dialect，以及执行汇编或与参考 GEMM 对数值的运行时。
