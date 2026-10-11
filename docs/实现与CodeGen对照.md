@@ -317,7 +317,7 @@ objectOffset + stackSize + 原立即数 + SPAdj
 
 向下增长时，对象偏移为负，加上栈大小后成为相对调整后的 `r31` 的非负位移。epilogue 插在第一个 terminator 之前。
 
-`mma.ll` 的矩阵值个数不超过 8，汇编里没有栈调整。`spill.ll` 把 9 个 MMA 结果放进循环 phi，使它们在回边上同时存活。单条指令最多读三个矩阵寄存器，活值个数仍然超过 `m0`–`m7`，因此至少有一个 MR 进入 1024 字节栈槽。汇编形态见 4.3。FP16 tile 若被 spill，使用的仍是 FP32 宽度的 `xai.mstore.f32` / `xai.mload.f32`。`xai.li` 标了 `isReMaterializable` 和 `isAsCheapAsAMove`，有符号 32 位常量在寄存器不够时可以重新物化。
+`mma.ll` 的矩阵值个数不超过 8，汇编里没有栈调整。`spill.ll` 把 9 个 MMA 结果放进循环 phi，使它们在回边上同时存活。单条指令最多读三个矩阵寄存器，活值个数仍然超过 `m0`–`m7`，因此至少有一个 MR 进入 1024 字节栈槽。当前分配结果是两个，从分配器插入 spill 到 PEI 换成 `r31` 偏移的每一步，见 4.3。FP16 tile 若被 spill，使用的仍是 FP32 宽度的 `xai.mstore.f32` / `xai.mload.f32`。`xai.li` 标了 `isReMaterializable` 和 `isAsCheapAsAMove`，有符号 32 位常量在寄存器不够时可以重新物化。
 
 ### 3.6 MC 与汇编打印
 
@@ -396,19 +396,127 @@ LBB0_3:
 
 ### 4.3 矩阵寄存器 spill
 
-`spill.ll` 计算 9 个相互依赖的 MMA 结果，并把它们作为循环 phi 传入循环体。循环体按迭代变化的地址逐个 store。9 个 `MR` 活值同时存在，物理寄存器只有 8 个。
+`spill.ll` 在入口块用 `%va`、`%vb` 连续算出 9 个 MMA 结果 `%r0`–`%r8`，再通过 9 个 phi `%s0`–`%s8` 把它们带进循环。循环每次迭代把这 9 个值依次存到 `%cp`，再把 `%cp` 前进 1024 字节。phi 在回边上传回的是自己，所以这 9 个矩阵值在整个循环里一直存活，而 MR 只有 `m0`–`m7`。
 
-汇编中的栈形态是：
+下面按阶段列出当前 `llc` 的输出，括号里是打印该阶段用的选项。寄存器号和槽的个数取决于分配结果。
+
+**1. 寄存器分配前。** 没有栈对象。拷贝只有参数进入虚拟寄存器的 `COPY`，例如 `%13:gpr = COPY $r0`。
+
+**2. 分配器插入 spill（`-print-after=greedy`）。**
 
 ```
-xai.addi r31, r31, -2048
-xai.mstore.f32 1024(r31), m1
-xai.mload.f32 m1, 1024(r31)
-xai.addi r31, r31, 2048
-xai.ret
+fi#0: size=1024, align=1024, at location [SP]
+fi#1: size=1024, align=1024, at location [SP]
+136B  XAI_MSTORE_F32 %24:mr, %stack.0, 0
+152B  XAI_MSTORE_F32 %27:mr, %stack.1, 0
+232B  %29:mr = COPY %30:mr
+424B  %25:mr = XAI_MLOAD_F32 %stack.0, 0
+440B  %28:mr = XAI_MLOAD_F32 %stack.1, 0
 ```
 
-`-2048` 表示两个 1024 字节槽。具体 spill 个数和偏移随分配结果变化；测试要求的是对 `r31` 的负向调整、`xai.mstore.f32` / `xai.mload.f32` 访问 `(r31)`，以及返回前的正向调整。
+Greedy 分配器决定把 `%r0`、`%r1` 放到栈上，为它们各建一个栈槽。槽的大小和对齐取自 `MR` 寄存器类，都是 1024 字节。随后它调用 `storeRegToStackSlot`，在值算出来之后插入 store；调用 `loadRegFromStackSlot`，在循环体使用之前插入 reload。这些指令里的 `%24`、`%25` 等是新的虚拟寄存器：原来跨越整个循环的长存活区间被拆成几段，每段只覆盖一次存或取。槽此时只有编号 `%stack.N`，位置都打印成 `[SP]`。
+
+`%29 = COPY %30` 也是分配器插入的。它把 `%va` 的存活区间拆开，让后半段换一个物理寄存器。
+
+**3. 换成物理寄存器（`-print-after=virtregrewriter`）。**
+
+```
+bb.0.entry:
+  $m7 = XAI_MLOAD_F16 killed $r0, 0          // %va
+  $m0 = XAI_MLOAD_F16 killed $r1, 0          // %vb
+  $m1 = XAI_MLOAD_F32 $r2, 0
+  $m1 = XAI_MMA $m7, $m0, killed $m1         // %r0
+  XAI_MSTORE_F32 $m1, %stack.0, 0
+  $m1 = XAI_MMA $m7, $m0, killed $m1         // %r1
+  XAI_MSTORE_F32 $m1, %stack.1, 0
+  $m2 = XAI_MMA $m7, $m0, killed $m1         // %r2
+  ...
+  $m6 = XAI_MMA $m7, $m0, $m5                // %r6
+  $m1 = COPY killed $m7                      // %va 从 m7 挪到 m1
+  $m7 = XAI_MMA $m1, $m0, $m6                // %r7
+  $m0 = XAI_MMA killed $m1, killed $m0, $m7  // %r8
+  $r0 = XAI_LI 0
+bb.2.body:
+  liveins: $m0, $m2, $m3, $m4, $m5, $m6, $m7, $r0, $r2, $r3
+  $m1 = XAI_MLOAD_F32 %stack.0, 0
+  XAI_MSTORE_F32 killed $m1, $r2, 0
+  $m1 = XAI_MLOAD_F32 %stack.1, 0
+  XAI_MSTORE_F32 killed $m1, $r2, 0
+  XAI_MSTORE_F32 $m2, $r2, 0
+  ...
+```
+
+进入循环时，7 个值留在 `m0`、`m2`–`m7`，`%s0`、`%s1` 在两个栈槽里。`m1` 不存放长期存活的值，专门用来装读回的数据：读回一个槽，存到 `%cp`，再读下一个。入口处，`%va` 原来在 `m7`，算 `%r7` 时 `m7` 要给 `%r7` 用，所以 `%va` 先通过那条 `COPY` 挪到 `m1`。参数 `COPY` 的两端被分到同一个物理寄存器，已经被删掉了。
+
+**4. PEI 确定栈帧（`-print-after=prologepilog`）。**
+
+```
+fi#0: size=1024, align=1024, at location [SP-1024]
+fi#1: size=1024, align=1024, at location [SP-2048]
+bb.0.entry:
+  $r31 = frame-setup XAI_ADDI $r31, -2048
+  ...
+  XAI_MSTORE_F32 $m1, $r31, 1024
+  ...
+  XAI_MSTORE_F32 $m1, $r31, 0
+bb.2.body:
+  $m1 = XAI_MLOAD_F32 $r31, 1024
+  ...
+  $m1 = XAI_MLOAD_F32 $r31, 0
+bb.3.exit:
+  $r31 = frame-destroy XAI_ADDI $r31, 2048
+  XAI_RET
+```
+
+`calculateFrameObjectOffsets` 把两个槽依次排在入口 SP 下方：`fi#0` 在 -1024，`fi#1` 在 -2048。两者都已经 1024 字节对齐，中间没有空隙，`StackSize` 为 2048。`emitPrologue` 在函数开头插入 `-2048`，`emitEpilogue` 在 `XAI_RET` 前插入 `+2048`。`eliminateFrameIndex` 把 `%stack.N, 0` 改成 `$r31, objectOffset + StackSize + 0`：`fi#0` 是 -1024 + 2048 = 1024，`fi#1` 是 -2048 + 2048 = 0。
+
+**5. 展开剩下的拷贝（`-print-after=postrapseudos`）。** `$m1 = COPY killed $m7` 的两端是不同的物理寄存器，`ExpandPostRAPseudos` 调用 `copyPhysReg`，生成 `$m1 = XAI_MMOV killed $m7`。
+
+**6. 分配后调度、分支整理和汇编输出。**
+
+```
+spill:
+	xai.addi r31, r31, -2048
+	xai.mload.f16 m7, 0(r0)
+	xai.mload.f16 m0, 0(r1)
+	xai.mload.f32 m1, 0(r2)
+	xai.li r0, 0
+	xai.mma m1, m7, m0, m1
+	xai.mstore.f32 1024(r31), m1
+	xai.mma m1, m7, m0, m1
+	xai.mma m2, m7, m0, m1
+	xai.mstore.f32 0(r31), m1
+	xai.mmov m1, m7
+	xai.mma m3, m7, m0, m2
+	xai.mma m4, m7, m0, m3
+	xai.mma m5, m7, m0, m4
+	xai.mma m6, m7, m0, m5
+	xai.mma m7, m1, m0, m6
+	xai.mma m0, m1, m0, m7
+	xai.bgeu r0, r3, LBB0_3
+LBB0_2:
+	xai.mload.f32 m1, 1024(r31)
+	xai.addi r0, r0, 1
+	xai.mstore.f32 0(r2), m1
+	xai.mload.f32 m1, 0(r31)
+	xai.mstore.f32 0(r2), m1
+	xai.mstore.f32 0(r2), m2
+	xai.mstore.f32 0(r2), m3
+	xai.mstore.f32 0(r2), m4
+	xai.mstore.f32 0(r2), m5
+	xai.mstore.f32 0(r2), m6
+	xai.mstore.f32 0(r2), m7
+	xai.mstore.f32 0(r2), m0
+	xai.addi r2, r2, 1024
+	xai.bltu r0, r3, LBB0_2
+LBB0_3:
+	xai.addi r31, r31, 2048
+	xai.ret
+```
+
+和 PEI 之后相比，顺序有三处变化，都是分配后调度做的：`xai.li r0, 0` 提到第一条 `xai.mma` 之前；`%r2` 的 `xai.mma` 提到第二次 spill 之前；循环体里的 `xai.addi r0, r0, 1` 提到第一次 reload 之后，填上 load 的等待。循环结构的整理和 4.2 一样：判断拆成入口的 `xai.bgeu` 和回边的 `xai.bltu`，跳到下一块的 `xai.br` 被删掉。
+
+FileCheck 不检查寄存器号、spill 个数和偏移，只检查四点：入口对 `r31` 的负向调整、`xai.mstore.f32` 写 `(r31)`、`xai.mload.f32` 读 `(r31)`，以及返回前的正向调整。
 
 ## 5. 文件索引
 
