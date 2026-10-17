@@ -48,4 +48,20 @@ third_party/llvm-project/build/bin/llvm-lit -v third_party/llvm-project/llvm/tes
 
 该脚本编译 `llc`、`llvm-config`、`FileCheck`、`not` 和 `count`。这个 LLVM 修订里的 `llvm-lit` 由 CMake 生成，不是 Ninja 目标，启动时要调用 `llvm-config`。
 
+## MLIR offload 前端
+
+`frontend/` 把一条 16×16 的 `linalg.matmul` 降成 `llvm.xai.*`。`gpu-module-to-binary` 里 `#xai.target` 实现 `gpu::TargetAttrInterface`：`serializeToObject` 调用上面的 `llc -mtriple=xai` 得到文本汇编，再装进 ELF64 的 `.xai_isa` 节。这一节里是汇编文本，不是机器码；XAI 没有指令编码器。offloading translate 只把这份设备 ELF 嵌进宿主 LLVM IR，最后由系统 `llc`（需要 X86 后端）写出宿主 ELF，`.xai_isa` 作为常量包在里面。
+
+```bash
+cmake -S frontend -B frontend/build -G Ninja -DMLIR_DIR=/usr/local/lib/cmake/mlir
+ninja -C frontend/build xai-compile
+./scripts/build_llc.sh
+frontend/build/bin/xai-compile \
+  --input frontend/test/matmul_xai.mlir \
+  --output /tmp/xai_matmul.o \
+  --dump-device-elf /tmp/xai_device.elf
+```
+
+`--pipeline-stop-after` 可以停在 `rewrite`、`outline`、`binary`、`llvm` 或 `elf`。
+
 后端使用 SelectionDAG。`llvm.xai.mma` 由 TableGen `Pat` 选成 `xai.mma`；带 chain 的 tile load/store 在 `XAIISelDAGToDAG` 中选择。当前能通过指令选择的是 `void` 函数、最多 8 个 `ptr`/`i64` 参数、五条 `llvm.xai.*` intrinsic、`i64` 加法，以及 `eq` / `ne` / `ult` 分支。完整范围和失败点见 CodeGen 文档第 6 节。
