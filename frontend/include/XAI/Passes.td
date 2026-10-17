@@ -19,6 +19,25 @@ def XAIMatmulToIntrinsic : Pass<"xai-matmul-to-intrinsic", "mlir::ModuleOp"> {
   ];
 }
 
+def XAIVectorToIntrinsic : Pass<"xai-vector-to-intrinsic", "mlir::ModuleOp"> {
+  let summary = "Rewrite 16x16 vector transfers and vector.contract into llvm.xai calls";
+  let description = [{
+    Inside `gpu.launch`, rewrites `vector.transfer_read` / `vector.transfer_write`
+    of a whole `memref<16x16xf16|f32>` into `llvm.xai.mload.*` /
+    `llvm.xai.mstore.*`, and a row-major 16x16x16 `vector.contract`
+    (f16 x f16 into f32, kind add) into `llvm.xai.mma`. The 2-D vectors are
+    bridged with `vector.shape_cast`, which folds away once all three are
+    rewritten. Transposed, masked, offset, or other shapes are rejected.
+  }];
+  let constructor = "mlir::xai::createVectorToIntrinsicPass()";
+  let dependentDialects = [
+    "mlir::LLVM::LLVMDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
 def XAIOutlineAndAttach : Pass<"xai-outline-and-attach", "mlir::ModuleOp"> {
   let summary = "Outline gpu.launch and attach #xai.target";
   let description = [{

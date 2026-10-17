@@ -4,32 +4,48 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 XAI_COMPILE="${XAI_COMPILE:-${ROOT}/build/bin/xai-compile}"
-INPUT="${ROOT}/test/matmul_xai.mlir"
 OUT="${OUT_DIR:-/tmp/xai-offload-check}"
 mkdir -p "${OUT}"
 
 die() { echo "error: $*" >&2; exit 1; }
 [[ -x "${XAI_COMPILE}" ]] || die "missing ${XAI_COMPILE}"
 
-echo "==> rewrite"
-"${XAI_COMPILE}" --input="${INPUT}" --pipeline-stop-after=rewrite \
-  --output="${OUT}/rewrite.mlir" >/dev/null
-grep -q 'llvm.xai.mload.f16' "${OUT}/rewrite.mlir"
-grep -q 'llvm.xai.mload.f32' "${OUT}/rewrite.mlir"
-grep -q 'llvm.xai.mma' "${OUT}/rewrite.mlir"
-grep -q 'llvm.xai.mstore.f32' "${OUT}/rewrite.mlir"
-if grep -q 'linalg.matmul' "${OUT}/rewrite.mlir"; then
-  die "linalg.matmul survived rewrite"
-fi
+# check_input NAME INPUT LEFTOVER_PATTERN
+check_input() {
+  local name="$1" input="$2" leftover="$3"
 
-echo "==> elf"
-"${XAI_COMPILE}" --input="${INPUT}" --output="${OUT}/matmul.o" \
-  --dump-device-elf="${OUT}/device.elf" >/dev/null
-file "${OUT}/matmul.o" | grep -qi 'ELF' || die "host output is not an ELF"
-file "${OUT}/device.elf" | grep -qi 'ELF' || die "device output is not an ELF"
-llvm-readelf -h "${OUT}/matmul.o" | head -5
-llvm-readelf -S "${OUT}/device.elf" | grep -q '.xai_isa' \
-  || die "device ELF is missing .xai_isa"
-strings "${OUT}/matmul.o" | grep -q 'xai.mma' \
-  || die "host ELF does not embed xai.mma"
-echo "OK: ${OUT}/matmul.o"
+  echo "==> ${name}: rewrite"
+  "${XAI_COMPILE}" --input="${input}" --pipeline-stop-after=rewrite \
+    --output="${OUT}/${name}.rewrite.mlir" >/dev/null
+  grep -q 'llvm.call @llvm.xai.mload.f16' "${OUT}/${name}.rewrite.mlir"
+  grep -q 'llvm.call @llvm.xai.mload.f32' "${OUT}/${name}.rewrite.mlir"
+  grep -q 'llvm.call @llvm.xai.mma' "${OUT}/${name}.rewrite.mlir"
+  grep -q 'llvm.call @llvm.xai.mstore.f32' "${OUT}/${name}.rewrite.mlir"
+  if grep -Eq "${leftover}" "${OUT}/${name}.rewrite.mlir"; then
+    die "${name}: '${leftover}' survived rewrite"
+  fi
+
+  echo "==> ${name}: elf"
+  "${XAI_COMPILE}" --input="${input}" --output="${OUT}/${name}.o" \
+    --dump-device-elf="${OUT}/${name}.device.elf" >/dev/null
+  file "${OUT}/${name}.o" | grep -qi 'ELF' || die "${name}: host output is not an ELF"
+  file "${OUT}/${name}.device.elf" | grep -qi 'ELF' \
+    || die "${name}: device output is not an ELF"
+  llvm-readelf -S "${OUT}/${name}.device.elf" | grep -q '.xai_isa' \
+    || die "${name}: device ELF is missing .xai_isa"
+  strings "${OUT}/${name}.o" | grep -q 'xai.mma' \
+    || die "${name}: host ELF does not embed xai.mma"
+  echo "OK: ${OUT}/${name}.o"
+}
+
+check_input linalg "${ROOT}/test/matmul_xai.mlir" 'linalg\.matmul'
+check_input vector "${ROOT}/test/matmul_vector_xai.mlir" 'vector\.'
+
+echo "==> vector: transposed B is rejected"
+if "${XAI_COMPILE}" --input="${ROOT}/test/matmul_vector_transposed_b.mlir" \
+    --pipeline-stop-after=rewrite >/dev/null 2>"${OUT}/transposed_b.err"; then
+  die "transposed B contraction was accepted"
+fi
+grep -q 'transposed operands are not supported' "${OUT}/transposed_b.err" \
+  || die "unexpected diagnostic: $(cat "${OUT}/transposed_b.err")"
+echo "OK: transposed B rejected"

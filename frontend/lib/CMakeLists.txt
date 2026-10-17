@@ -11,7 +11,9 @@ add_public_tablegen_target(XAIPassIncGen)
 
 add_library(XAIFrontend STATIC
   XAIDialect.cpp
+  Intrinsics.cpp
   MatmulToIntrinsic.cpp
+  VectorToIntrinsic.cpp
   OutlineAndAttach.cpp
   Target.cpp
   Pipeline.cpp
@@ -47,5 +49,7 @@ target_link_libraries(XAIFrontend PUBLIC
   MLIRSupport
   MLIRTargetLLVMIRExport
   MLIRToLLVMIRTranslationRegistration
+  MLIRTransformUtils
   MLIRTransforms
+  MLIRVectorDialect
 )

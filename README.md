@@ -64,4 +64,6 @@ frontend/build/bin/xai-compile \
 
 `--pipeline-stop-after` 可以停在 `rewrite`、`outline`、`binary`、`llvm` 或 `elf`。
 
+输入也可以已经是 vector 层：`gpu.launch` 里的 `vector.transfer_read`、`vector.contract`、`vector.transfer_write`（见 `frontend/test/matmul_vector_xai.mlir`）。没有 `linalg.matmul` 时 rewrite 阶段改跑 `xai-vector-to-intrinsic`，把整块 16×16 的读写换成 `llvm.xai.mload.*` / `mstore.*`，把行主序的 f16×f16→f32 contract 换成 `llvm.xai.mma`。转置、带 mask、起点非 0 的形式会直接报错。`bash frontend/test/check_matmul.sh` 同时检查这两种输入。
+
 后端使用 SelectionDAG。`llvm.xai.mma` 由 TableGen `Pat` 选成 `xai.mma`；带 chain 的 tile load/store 在 `XAIISelDAGToDAG` 中选择。当前能通过指令选择的是 `void` 函数、最多 8 个 `ptr`/`i64` 参数、五条 `llvm.xai.*` intrinsic、`i64` 加法，以及 `eq` / `ne` / `ult` 分支。完整范围和失败点见 CodeGen 文档第 6 节。

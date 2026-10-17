@@ -14,6 +14,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h"
@@ -290,8 +291,16 @@ LogicalResult mlir::xai::runXAIPipeline(ModuleOp module,
     return success();
   };
 
-  if (failed(runStage("rewrite", [](OpPassManager &pm) {
-        pm.addPass(createMatmulToIntrinsicPass());
+  bool hasLinalgMatmul = false;
+  module.walk([&](linalg::MatmulOp) {
+    hasLinalgMatmul = true;
+    return WalkResult::interrupt();
+  });
+  if (failed(runStage("rewrite", [&](OpPassManager &pm) {
+        if (hasLinalgMatmul)
+          pm.addPass(createMatmulToIntrinsicPass());
+        else
+          pm.addPass(createVectorToIntrinsicPass());
       })))
     return failure();
   if (options.stopAfter == StopAfter::Rewrite)

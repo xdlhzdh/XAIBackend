@@ -9,6 +9,7 @@ namespace mlir::xai {
 #include "Passes.h.inc"
 
 std::unique_ptr<Pass> createMatmulToIntrinsicPass();
+std::unique_ptr<Pass> createVectorToIntrinsicPass();
 std::unique_ptr<Pass> createOutlineAndAttachPass();
 
 } // namespace mlir::xai

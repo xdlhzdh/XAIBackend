@@ -10,6 +10,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
@@ -64,7 +65,7 @@ int main(int argc, char **argv) {
   registry.insert<arith::ArithDialect, cf::ControlFlowDialect, DLTIDialect,
                   func::FuncDialect, gpu::GPUDialect, index::IndexDialect,
                   LLVM::LLVMDialect, linalg::LinalgDialect, memref::MemRefDialect,
-                  xai::XAIDialect>();
+                  vector::VectorDialect, xai::XAIDialect>();
   xai::registerXAITargetInterfaceExternalModels(registry);
   registerAllToLLVMIRTranslations(registry);
   gpu::registerOffloadingLLVMTranslationInterfaceExternalModels(registry);

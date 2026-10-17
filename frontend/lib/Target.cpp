@@ -6,6 +6,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -217,21 +218,13 @@ LogicalResult buildDeviceModule(gpu::GPUModuleOp gpuModule,
   device = ModuleOp::create(gpuModule.getLoc());
   OpBuilder builder(device->getContext());
   builder.setInsertionPointToEnd(device->getBody());
-  Location loc = gpuModule.getLoc();
   auto ptrTy = LLVM::LLVMPointerType::get(ctx);
-  auto tileF16 = VectorType::get({256}, builder.getF16Type());
-  auto tileF32 = VectorType::get({256}, builder.getF32Type());
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
 
-  auto decl = [&](StringRef name, Type result, ArrayRef<Type> args) {
-    auto type = LLVM::LLVMFunctionType::get(result, args);
-    builder.setInsertionPointToStart(device->getBody());
-    builder.create<LLVM::LLVMFuncOp>(loc, name, type);
-  };
-  decl("llvm.xai.mload.f16", tileF16, {ptrTy});
-  decl("llvm.xai.mload.f32", tileF32, {ptrTy});
-  decl("llvm.xai.mma", tileF32, {tileF16, tileF16, tileF32});
-  decl("llvm.xai.mstore.f32", voidTy, {ptrTy, tileF32});
+  for (auto decl : gpuModule.getOps<LLVM::LLVMFuncOp>()) {
+    if (decl.isExternal() && decl.getName().starts_with("llvm.xai."))
+      builder.clone(*decl.getOperation());
+  }
 
   bool sawKernel = false;
   for (gpu::GPUFuncOp func : gpuModule.getOps<gpu::GPUFuncOp>()) {
@@ -262,7 +255,7 @@ LogicalResult buildDeviceModule(gpu::GPUModuleOp gpuModule,
     for (Operation &op : func.getBody().front().without_terminator()) {
       // Outlining always materializes block/thread ids. This kernel does not
       // use them; only the pointer chain and the llvm.xai calls are lowered.
-      if (isa<gpu::GPUDialect>(op.getDialect()))
+      if (isa<gpu::GPUDialect>(op.getDialect()) || isOpTriviallyDead(&op))
         continue;
       if (isa<memref::ExtractAlignedPointerAsIndexOp, arith::IndexCastOp>(op))
         continue;
